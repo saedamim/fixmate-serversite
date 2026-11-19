@@ -6,13 +6,11 @@ dotenv.config();
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
-let db;
+const db = client.db("fixmate");
 
 const connectDB = async () => {
   try {
     await client.connect();
-
-    db = client.db("fixmate");
 
     await db.command({ ping: 1 });
 
@@ -25,5 +23,6 @@ const connectDB = async () => {
   }
 };
 
-export { db };
+export { client, db };
 export default connectDB;
+

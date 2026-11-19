@@ -8,11 +8,14 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
+    "@better-auth/mongo-adapter": "^1.7.25",
+    "better-auth": "^1.7.25",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "jose": "^6.1.0",
-    "mongodb": "^6.22.0"
+    "mongodb": "^6.22.0",
+    "multer": "^2.5.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"

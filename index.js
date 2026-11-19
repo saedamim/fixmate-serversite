@@ -1,20 +1,26 @@
+import uploadRoutes from "./routes/upload.routes.js";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { toNodeHandler } from "better-auth/node";
 import connectDB from "./config/db.js";
-import { MongoClient } from "mongodb";
+import { auth } from "./config/auth.js";
+
 dotenv.config();
 
 const app = express();
 
-app.use(cors({
-  origin: process.env.FRONTEND_URL,
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL,
+    credentials: true,
+  })
+);
 
-const client = new MongoClient(`mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.owiwght.mongodb.net/`);
+app.all("/api/auth/*splat", toNodeHandler(auth));
+
 app.use(express.json());
-
+app.use("/api/upload", uploadRoutes);
 app.get("/", (req, res) => {
   res.send("FixMate API is running!");
 });
@@ -34,3 +40,4 @@ const startServer = async () => {
 };
 
 startServer();
+
