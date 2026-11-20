@@ -6,15 +6,17 @@ const JWKS = createRemoteJWKSet(
 );
 
 const verifyToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
+  console.log("VerifyToken middleware called");
 
-    if (!authHeader?.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Unauthorized access",
-      });
-    }
+  try {
+   const authHeader = req.headers.authorization;
+
+if (!authHeader?.startsWith("Bearer ")) {
+  return res.status(401).json({
+    success: false,
+    message: "Unauthorized access",
+  });
+}
 
     const token = authHeader.split(" ")[1];
 
@@ -27,6 +29,8 @@ const verifyToken = async (req, res, next) => {
 
     next();
   } catch (error) {
+    console.error("JWT Verification Error:", error.message);
+
     return res.status(401).json({
       success: false,
       message: "Invalid or expired token",
@@ -35,4 +39,5 @@ const verifyToken = async (req, res, next) => {
 };
 
 export default verifyToken;
+
 

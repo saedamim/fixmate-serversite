@@ -5,6 +5,8 @@ import dotenv from "dotenv";
 import { toNodeHandler } from "better-auth/node";
 import connectDB from "./config/db.js";
 import { auth } from "./config/auth.js";
+import verifyToken from "./middlewares/verifyToken.js";
+import verifyRole from "./middlewares/verifyRole.js";
 
 dotenv.config();
 
@@ -21,6 +23,18 @@ app.all("/api/auth/*splat", toNodeHandler(auth));
 
 app.use(express.json());
 app.use("/api/upload", uploadRoutes);
+app.get(
+  "/api/test/customer",
+  verifyToken,
+  verifyRole("customer"),
+  (req, res) => {
+    res.json({
+      success: true,
+      message: "Customer access granted!",
+      user: req.user,
+    });
+  }
+);
 app.get("/", (req, res) => {
   res.send("FixMate API is running!");
 });
