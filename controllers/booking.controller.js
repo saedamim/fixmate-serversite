@@ -4,8 +4,16 @@ import { db } from "../config/db.js";
 const bookings = () => db.collection("bookings");
 
 const TIME_SLOTS = ["09:00-12:00", "12:00-15:00", "15:00-18:00"];
-const STATUSES = ["pending", "accepted", "in_progress", "completed", "cancelled", "rejected"];
+const STATUSES = ["requested", "accepted", "in_progress", "completed", "cancelled", "rejected"];
 const ID_PATTERN = /^[a-f\d]{24}$/i;
+
+// Technician status updates: new status -> the only status it may move from.
+const TRANSITIONS = {
+  accepted: "requested",
+  rejected: "requested",
+  in_progress: "accepted",
+  completed: "in_progress",
+};
 
 // Match the frontend style: expose `_id` as `id`, ObjectIds as strings.
 const toBooking = ({ _id, serviceId, ...rest }) => ({
@@ -90,13 +98,18 @@ export const createBooking = async (req, res) => {
     category: service.category,
     mode: service.mode,
     price: service.price,
+    // `technician` is kept because the customer dashboard already reads it.
     technician: service.technician,
+    technicianName: service.technician,
+    // Both come only from the service record, never the request body.
+    // Services without a technicianEmail produce bookings no technician can see or update.
+    technicianEmail: text(service.technicianEmail).toLowerCase() || null,
     preferredDate: text(body.preferredDate),
     preferredTime: text(body.preferredTime),
     phone: text(body.phone),
     address: service.mode === "In-shop" ? "" : text(body.address),
     problemDescription: text(body.problemDescription),
-    status: "pending",
+    status: "requested",
     isActive: true,
     paymentStatus: "unpaid",
     createdAt: now,
@@ -161,9 +174,9 @@ export const cancelBooking = async (req, res) => {
   const filter = { _id: new ObjectId(id), customerId: req.user.id };
   const now = new Date();
 
-  // Atomic: only a pending booking that belongs to this customer can be cancelled
+  // Atomic: only a requested booking that belongs to this customer can be cancelled
   const cancelled = await bookings().findOneAndUpdate(
-    { ...filter, status: "pending" },
+    { ...filter, status: "requested" },
     { $set: { status: "cancelled", isActive: false, cancelledAt: now, updatedAt: now } },
     { returnDocument: "after" }
   );
@@ -173,5 +186,77 @@ export const cancelBooking = async (req, res) => {
   const exists = await bookings().countDocuments(filter);
   if (!exists) return res.status(404).json({ message: "Booking not found" });
 
-  res.status(409).json({ message: "Only pending bookings can be cancelled" });
+  res.status(409).json({ message: "Only requested bookings can be cancelled" });
+};
+
+// Technician: bookings assigned to the authenticated technician's email
+export const getTechnicianBookings = async (req, res) => {
+  const email = text(req.user.email).toLowerCase();
+  if (!email) return res.status(403).json({ message: "Access forbidden" });
+
+  const page = Math.max(parseInt(req.query.page) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 50);
+
+  const filter = { technicianEmail: email };
+  if (STATUSES.includes(req.query.status)) filter.status = req.query.status;
+
+  const [items, total] = await Promise.all([
+    bookings()
+      .find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+    bookings().countDocuments(filter),
+  ]);
+
+  res.json({
+    bookings: items.map(toBooking),
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+  });
+};
+
+// Technician: move an assigned booking through requested -> accepted/rejected -> in_progress -> completed
+export const updateBookingStatus = async (req, res) => {
+  const { id } = req.params;
+  const email = text(req.user.email).toLowerCase();
+  const body = req.body ?? {};
+  const status = text(body.status);
+
+  if (!email || !ID_PATTERN.test(id)) return res.status(404).json({ message: "Booking not found" });
+  if (!TRANSITIONS[status]) {
+    return res.status(400).json({ message: `Status must be one of: ${Object.keys(TRANSITIONS).join(", ")}` });
+  }
+
+  const set = { status, updatedAt: new Date() };
+
+  if (status === "completed") {
+    const { finalAmount } = body;
+    if (typeof finalAmount !== "number" || !Number.isFinite(finalAmount) || finalAmount <= 0) {
+      return res.status(400).json({ message: "finalAmount must be a positive number" });
+    }
+    set.finalAmount = finalAmount;
+    set.completedAt = set.updatedAt;
+  }
+  // A rejected or completed booking no longer blocks the customer from booking again
+  if (status === "rejected" || status === "completed") set.isActive = false;
+
+  const filter = { _id: new ObjectId(id), technicianEmail: email };
+
+  // Atomic: assigned to this technician AND currently in the required previous status
+  const updated = await bookings().findOneAndUpdate(
+    { ...filter, status: TRANSITIONS[status] },
+    { $set: set },
+    { returnDocument: "after" }
+  );
+
+  if (updated) return res.json({ message: `Booking ${status}`, booking: toBooking(updated) });
+
+  const exists = await bookings().countDocuments(filter);
+  if (!exists) return res.status(404).json({ message: "Booking not found" });
+
+  res.status(409).json({ message: `Booking cannot move to "${status}" from its current status` });
 };

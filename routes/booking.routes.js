@@ -6,12 +6,20 @@ import {
   getMyBookings,
   getBookingById,
   cancelBooking,
+  getTechnicianBookings,
+  updateBookingStatus,
 } from "../controllers/booking.controller.js";
 
 const router = express.Router();
 
-// Customer booking flow: every route needs a valid token and the "customer" role
-router.use(verifyToken, verifyRole("customer"));
+router.use(verifyToken);
+
+// Technician routes (declared first so "/technician" is not read as an id)
+router.get("/technician", verifyRole("technician"), getTechnicianBookings);
+router.patch("/technician/:id/status", verifyRole("technician"), updateBookingStatus);
+
+// Customer booking flow: everything below needs the "customer" role
+router.use(verifyRole("customer"));
 
 router.post("/", createBooking);
 router.get("/my", getMyBookings); // must stay above "/:id"
