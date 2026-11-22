@@ -5,7 +5,7 @@ import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import fs from "node:fs";
 import { ObjectId } from "mongodb";
-import { TARGETS, checkTargets, checkTargetsWith, mongoReader, resetPasswords } from "../scripts/lib/reset-passwords.js";
+import { TARGETS, selectTargets, checkTargets, checkTargetsWith, mongoReader, resetPasswords } from "../scripts/lib/reset-passwords.js";
 
 const OLD = "old-password-123";
 const NEW = { "ahsan@gmail.com": "brand-new-pass-1", "abdurrahim@gmail.com": "brand-new-pass-2", "yeasminmem@gmail.com": "brand-new-pass-3" };
@@ -226,4 +226,33 @@ test("the script does not load Better Auth unless --apply is used", () => {
   assert.ok(!/^import .*config\/auth\.js/m.test(source), "no static import of config/auth.js");
   const dynamic = source.indexOf(`import("../config/auth.js")`);
   assert.ok(dynamic > source.indexOf("if (!apply)"), "Better Auth is only imported after the dry-run return");
+});
+
+// ---- --only (subset) ----
+
+test("--only resets just the chosen accounts and leaves the admin completely untouched", async () => {
+  const { ctx } = await makeEnv([...targetUsers(), other]);
+  const only = selectTargets("ahsan@gmail.com,abdurrahim@gmail.com");
+  const admin = await snapshot(ctx, "yeasminmem@gmail.com");
+  const { "yeasminmem@gmail.com": _a, ...two } = NEW;
+
+  const done = await resetPasswords(ctx, two, only);
+  assert.deepEqual(done.map((d) => d.email), ["ahsan@gmail.com", "abdurrahim@gmail.com"]);
+  assert.ok(await canLogin(ctx, "ahsan@gmail.com", NEW["ahsan@gmail.com"]));
+  assert.ok(await canLogin(ctx, "abdurrahim@gmail.com", NEW["abdurrahim@gmail.com"]));
+  assert.deepEqual(await snapshot(ctx, "yeasminmem@gmail.com"), admin);
+  assert.ok(await canLogin(ctx, "yeasminmem@gmail.com", OLD));
+});
+
+test("--only cannot widen the set: unknown or empty lists are rejected, no flag means all three", () => {
+  assert.throws(() => selectTargets("someone@else.com"), /--only must list/);
+  assert.throws(() => selectTargets("ahsan@gmail.com,someone@else.com"), /not allowed: someone@else.com/);
+  assert.throws(() => selectTargets(""), /--only must list/);
+  assert.equal(selectTargets(undefined), TARGETS);
+  assert.deepEqual(selectTargets(" AHSAN@gmail.com ").map((t) => t.email), ["ahsan@gmail.com"]);
+});
+
+test("--only with a password for an account outside the subset is refused", async () => {
+  const { ctx } = await makeEnv(targetUsers());
+  await assert.rejects(resetPasswords(ctx, NEW, selectTargets("ahsan@gmail.com")), /exactly the three target accounts/);
 });

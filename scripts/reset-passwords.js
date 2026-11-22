@@ -3,6 +3,7 @@
 //   cd fixmate-server
 //   node scripts/reset-passwords.js            -> DRY RUN: checks the accounts, asks for nothing, writes nothing
 //   node scripts/reset-passwords.js --apply    -> asks for the three new passwords (hidden), then writes them
+//   Add --only=ahsan@gmail.com,abdurrahim@gmail.com to touch just those accounts (others are not even read).
 //
 // The dry run uses plain MongoDB find queries only. It never loads Better Auth (whose Mongo adapter can create
 // indexes on first use), so it cannot write anything. Better Auth is loaded only for --apply.
@@ -12,7 +13,7 @@
 // Delete this script and scripts/lib/reset-passwords.js once the reset is done.
 import readline from "node:readline";
 import connectDB, { client, db } from "../config/db.js";
-import { TARGETS, MIN_LENGTH, MAX_LENGTH, checkTargetsWith, mongoReader, resetPasswords } from "./lib/reset-passwords.js";
+import { TARGETS, MIN_LENGTH, MAX_LENGTH, checkTargetsWith, mongoReader, resetPasswords, selectTargets } from "./lib/reset-passwords.js";
 
 // ---- Terminal prompts: ONE readline interface for the whole session, hidden password input, and clean
 // cancellation (Ctrl+C, Ctrl+D or a closed input all reject with CancelledError so the database connection is closed).
@@ -85,9 +86,19 @@ const askPassword = async (prompter, email, { min, max, log = console.log }) => 
   }
 };
 
-const apply = process.argv.slice(2).includes("--apply");
-if (process.argv.slice(2).some((arg) => arg !== "--apply")) {
-  console.error("Usage: node scripts/reset-passwords.js [--apply]");
+const args = process.argv.slice(2);
+const apply = args.includes("--apply");
+const onlyArg = args.find((arg) => arg.startsWith("--only="));
+if (args.some((arg) => arg !== "--apply" && arg !== onlyArg)) {
+  console.error("Usage: node scripts/reset-passwords.js [--only=email1,email2] [--apply]");
+  process.exit(1);
+}
+
+let targets;
+try {
+  targets = selectTargets(onlyArg?.slice("--only=".length));
+} catch (error) {
+  console.error(error.message);
   process.exit(1);
 }
 
@@ -98,9 +109,9 @@ const run = async () => {
 
   await connectDB();
   // Read-only check with direct MongoDB find queries
-  const plan = await checkTargetsWith(mongoReader(db));
+  const plan = await checkTargetsWith(mongoReader(db), targets);
 
-  console.log("\nVerified (read-only). All three accounts exist, have the expected role, exactly one email/password login, and a matching accountId:");
+  console.log("\nVerified (read-only). Every listed account exists, have the expected role, exactly one email/password login, and a matching accountId:");
   for (const item of plan) console.log(`  ${item.email.padEnd(24)} role: ${item.role}`);
 
   if (!apply) {
@@ -108,7 +119,7 @@ const run = async () => {
     return;
   }
 
-  console.log("\nOnly the password of these three accounts will change. Nothing else is touched.");
+  console.log("\nOnly the password of the accounts listed above will change. Nothing else is touched.");
   prompter = createPrompter();
   if ((await prompter.ask("Type RESET to continue: ")) !== "RESET") {
     console.log("Cancelled. Nothing was changed.");
@@ -121,9 +132,9 @@ const run = async () => {
 
   // All three passwords are collected first; nothing is written until every one is typed and confirmed
   const passwords = {};
-  for (const { email } of TARGETS) passwords[email] = await askPassword(prompter, email, { min: MIN_LENGTH, max: MAX_LENGTH });
+  for (const { email } of targets) passwords[email] = await askPassword(prompter, email, { min: MIN_LENGTH, max: MAX_LENGTH });
 
-  const done = await resetPasswords(ctx, passwords);
+  const done = await resetPasswords(ctx, passwords, targets);
   console.log("\nDone. Passwords updated and verified for:");
   for (const item of done) console.log(`  ${item.email}  (${item.role})`);
 };

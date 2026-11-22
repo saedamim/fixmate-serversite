@@ -16,6 +16,18 @@ export const TARGETS = Object.freeze([
   Object.freeze({ email: "yeasminmem@gmail.com", role: "admin" }),
 ]);
 
+// Narrows TARGETS to the emails listed after --only=. Only emails that are already in TARGETS are accepted, so this can
+// shrink the set of accounts but never widen it. No --only (undefined) means all three.
+export const selectTargets = (only) => {
+  if (only === undefined) return TARGETS;
+  const wanted = only.split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
+  const unknown = wanted.filter((email) => !TARGETS.some((target) => target.email === email));
+  if (wanted.length === 0 || unknown.length > 0) {
+    throw new Error(`--only must list one or more of: ${TARGETS.map((target) => target.email).join(", ")}${unknown.length ? ` (not allowed: ${unknown.join(", ")})` : ""}`);
+  }
+  return TARGETS.filter((target) => wanted.includes(target.email));
+};
+
 export const MIN_LENGTH = 8;
 export const MAX_LENGTH = 128;
 
