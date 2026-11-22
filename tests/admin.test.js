@@ -123,7 +123,7 @@ test("stats match the database", async () => {
   assert.equal(body.bookings.completed, await count("bookings", { status: "completed" }));
 
   // Revenue is the total of verified "paid" payments only (not completed bookings)
-  const paid = await db.collection("payments").find({ status: "paid" }).toArray();
+  const paid = await db.collection("payments").find({ paymentStatus: "paid" }).toArray();
   assert.equal(body.revenue, paid.reduce((total, p) => total + p.amount, 0));
 });
 

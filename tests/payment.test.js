@@ -1,301 +1,434 @@
-// Payment tests. SSLCommerz is MOCKED (global fetch is replaced), so no real request or transaction happens.
-// Controllers run directly against the real database using temporary bookings that are removed afterwards.
-// The HTTP checks (401/403) need a running server with the latest code (API_URL, default BETTER_AUTH_URL).
+// Stripe payment tests. Stripe is MOCKED (checkout.sessions.create/retrieve), so no request reaches Stripe and no
+// money moves. Webhook signatures use Stripe's own library with a fake secret, so real signature checking runs.
+// Controllers run against the real database using temporary bookings that are removed afterwards.
+// The HTTP checks need a running server with the latest code (API_URL, default BETTER_AUTH_URL).
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import dotenv from "dotenv";
+import Stripe from "stripe";
 import { ObjectId } from "mongodb";
 import connectDB, { client, db } from "../config/db.js";
-import { createHash } from "node:crypto";
-import { initiatePayment, getMyPayments, handleIpn } from "../controllers/payment.controller.js";
+import { useStripe } from "../config/stripe.js";
+import { createCheckoutSession, verifyPayment, handleWebhook, getMyPayments } from "../controllers/payment.controller.js";
 import { getTransactions, getStats } from "../controllers/admin.controller.js";
 
 dotenv.config({ quiet: true });
-// Placeholder sandbox settings: the real credentials are never needed because fetch is mocked
-process.env.SSLCOMMERZ_STORE_ID = "fm_test_store";
-process.env.SSLCOMMERZ_STORE_PASSWORD = "fm_test_password";
-process.env.SSLCOMMERZ_SANDBOX = "true";
+process.env.STRIPE_SECRET_KEY = "sk_test_fm_dummy_key";
+process.env.STRIPE_WEBHOOK_SECRET = "whsec_fm_test_secret";
 
 const AUTH_URL = process.env.BETTER_AUTH_URL;
 const API_URL = process.env.API_URL || AUTH_URL;
 const ORIGIN = process.env.FRONTEND_URL;
-const realFetch = globalThis.fetch;
 const stamp = Date.now();
 const CUSTOMER = { id: `fm-test-pay-cust-${stamp}`, name: "FM Pay Test", email: `fm-test-pay-${stamp}@example.test` };
 const OTHER = { id: `fm-test-pay-other-${stamp}`, name: "FM Pay Other", email: `fm-test-pay-other-${stamp}@example.test` };
-const bookingIds = [];
 const mailbox = `fm-test-pay-http-${stamp}@example.test`;
-let calls; // provider requests captured by the mock
-let validationReply; // what the mocked Order Validation API returns
+const bookingIds = [];
 
-// Mock of the two SSLCommerz endpoints; any other URL fails the test
-globalThis.fetch = async (url, options = {}) => {
-  const href = String(url);
-  if (!href.startsWith("https://sandbox.sslcommerz.com/")) return realFetch(url, options);
-  calls.push({ url: href, body: options.body ? Object.fromEntries(options.body) : null });
-  const json = href.includes("/gwprocess/")
-    ? { status: "SUCCESS", GatewayPageURL: "https://sandbox.sslcommerz.com/gw/test-session", sessionkey: "KEY123" }
-    : validationReply;
-  return { ok: true, status: 200, json: async () => json };
+// Offline Stripe object: only its webhook signature code is real
+const stripeLib = new Stripe("sk_test_fm_dummy_key");
+let created; // arguments of checkout.sessions.create calls
+let remote; // what Stripe "knows": sessionId -> session object returned by retrieve
+let counter = 0;
+const mock = {
+  checkout: {
+    sessions: {
+      create: async (params) => {
+        const id = `cs_test_fm${stamp}x${++counter}`;
+        created.push(params);
+        remote[id] = { id, mode: "payment", currency: "usd", payment_status: "unpaid", amount_total: params.line_items[0].price_data.unit_amount, payment_intent: `pi_fm${counter}`, metadata: params.metadata };
+        return { id, url: `https://checkout.stripe.com/c/pay/${id}` };
+      },
+      retrieve: async (id) => {
+        if (!remote[id]) throw new Error("No such checkout.session");
+        return remote[id];
+      },
+    },
+  },
+  webhooks: stripeLib.webhooks,
 };
 
-const run = async (handler, { user, body, query = {} } = {}) => {
+const run = async (handler, { user, body, query = {}, headers = {} } = {}) => {
   const out = { status: 200, body: undefined };
   const res = { status(c) { out.status = c; return res; }, json(p) { out.body = p; return res; } };
-  await handler({ user, body, query, params: {} }, res);
+  await handler({ user, body, query, headers, params: {} }, res);
   return out;
 };
 
 const newBooking = async (overrides = {}) => {
   const { insertedId } = await db.collection("bookings").insertOne({
     customerId: CUSTOMER.id, serviceId: new ObjectId(), serviceTitle: "FM TEST pay service", category: "AC",
-    technicianEmail: "fm-test-tech@example.test", phone: "01700000000", address: "", status: "completed",
-    isActive: false, paymentStatus: "unpaid", finalAmount: 1500, createdAt: new Date(), updatedAt: new Date(), ...overrides,
+    technician: "Test Technician", technicianName: "Test Technician", technicianEmail: "fm-test-tech@example.test",
+    status: "completed", isActive: false, paymentStatus: "unpaid", finalAmount: 75.5,
+    createdAt: new Date(), updatedAt: new Date(), ...overrides,
   });
   bookingIds.push(insertedId);
   return insertedId;
 };
-const initiate = async (bookingId, extra = {}, user = CUSTOMER) =>
-  run(initiatePayment, { user, body: { bookingId: bookingId.toString(), ...extra } });
+const checkout = (bookingId, user = CUSTOMER, extra = {}) =>
+  run(createCheckoutSession, { user, body: { bookingId: bookingId.toString(), ...extra } });
 const paymentFor = (bookingId) => db.collection("payments").findOne({ bookingId });
 const booking = (id) => db.collection("bookings").findOne({ _id: id });
-// Builds an IPN body signed the way SSLCommerz documents it (verify_key fields + md5(store password), sorted, md5)
-const sign = (fields, password = process.env.SSLCOMMERZ_STORE_PASSWORD) => {
-  const names = Object.keys(fields).sort();
-  const signed = { ...fields, store_passwd: createHash("md5").update(password).digest("hex") };
-  const text = Object.keys(signed).sort().map((k) => `${k}=${signed[k]}`).join("&");
-  return { ...fields, verify_key: names.join(","), verify_sign: createHash("md5").update(text).digest("hex") };
+const verify = (sessionId, user = CUSTOMER) => run(verifyPayment, { user, query: { session_id: sessionId } });
+const markPaidAtStripe = (sessionId, fields = {}) => { Object.assign(remote[sessionId], { payment_status: "paid" }, fields); };
+
+// A webhook request signed with Stripe's own algorithm
+const webhook = (event, { secret = process.env.STRIPE_WEBHOOK_SECRET, tamper = false } = {}) => {
+  const payload = JSON.stringify(event);
+  const signature = stripeLib.webhooks.generateTestHeaderString({ payload, secret });
+  return run(handleWebhook, { body: Buffer.from(tamper ? payload.replace("checkout.session", "checkout.sessio_") : payload), headers: { "stripe-signature": signature } });
 };
-const ipnBody = (payment, fields = {}) =>
-  sign({ tran_id: payment.tranId, val_id: "VAL1", status: "VALID", amount: payment.amount.toFixed(2), currency: "BDT", ...fields });
-const ipn = (payment, fields = {}) => run(handleIpn, { body: ipnBody(payment, fields) });
-const goodValidation = (payment, fields = {}) => {
-  validationReply = {
-    status: "VALID", tran_id: payment.tranId, val_id: "VAL1", amount: payment.amount.toFixed(2),
-    currency_type: "BDT", currency: "BDT", risk_level: "0", bank_tran_id: "BANK1", card_type: "VISA-Dutch Bangla", ...fields,
-  };
-};
+const sessionEvent = (type, sessionId) => ({ id: `evt_fm_${++counter}`, object: "event", type, data: { object: remote[sessionId] } });
 
 before(async () => {
   await connectDB();
-  await db.collection("payments").createIndex({ tranId: 1 }, { unique: true, name: "unique_tran_id" });
-  await db.collection("payments").createIndex(
-    { bookingId: 1 },
-    { unique: true, partialFilterExpression: { status: "pending" }, name: "one_pending_payment_per_booking" }
-  );
+  useStripe(mock);
 });
-beforeEach(() => { calls = []; validationReply = null; });
+beforeEach(() => { created = []; remote = {}; });
 
 after(async () => {
+  useStripe(undefined);
   await db.collection("payments").deleteMany({ bookingId: { $in: bookingIds } });
   await db.collection("bookings").deleteMany({ _id: { $in: bookingIds } });
   await db.collection("session").deleteMany({ userId: mailbox });
   await db.collection("user").deleteOne({ email: mailbox });
-  globalThis.fetch = realFetch;
   await client.close();
 });
 
-test("initiation: own completed unpaid booking works; amount/status/currency from the client are ignored", async () => {
-  const id = await newBooking({ finalAmount: 1500 });
-  const r = await initiate(id, { amount: 1, finalAmount: 1, currency: "USD", paymentStatus: "paid", status: "paid" });
+// ---- checkout creation ----
+
+test("checkout: own completed unpaid booking; amount comes from the database, client values are ignored", async () => {
+  const id = await newBooking({ finalAmount: 75.5 });
+  const r = await checkout(id, CUSTOMER, { amount: 1, finalAmount: 1, currency: "eur", paymentStatus: "paid", status: "paid" });
   assert.equal(r.status, 201);
-  assert.equal(r.body.gatewayUrl, "https://sandbox.sslcommerz.com/gw/test-session");
-  assert.deepEqual(Object.keys(r.body).sort(), ["gatewayUrl", "paymentId", "tranId"]);
+  assert.match(r.body.url, /^https:\/\/checkout\.stripe\.com\//);
+
+  const params = created[0];
+  assert.equal(params.mode, "payment");
+  assert.equal(params.line_items[0].price_data.unit_amount, 7550); // 75.50 * 100, from the booking
+  assert.equal(params.line_items[0].price_data.currency, "usd");
+  assert.deepEqual(params.metadata, { bookingId: id.toString(), customerEmail: CUSTOMER.email });
+  assert.equal(params.success_url, `${process.env.FRONTEND_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`);
+  assert.equal(params.cancel_url, `${process.env.FRONTEND_URL}/payment/cancel`);
 
   const saved = await paymentFor(id);
-  assert.equal(saved.amount, 1500);
-  assert.equal(saved.currency, "BDT");
-  assert.equal(saved.status, "pending");
-  assert.equal(saved.customerId, CUSTOMER.id);
+  assert.equal(saved.paymentStatus, "pending");
+  assert.equal(saved.amount, 75.5);
+  assert.equal(saved.stripeSessionId, r.body.sessionId);
   assert.equal((await booking(id)).paymentStatus, "unpaid");
-
-  const sent = calls[0].body;
-  assert.equal(sent.total_amount, "1500.00");
-  assert.equal(sent.currency, "BDT");
-  assert.equal(sent.tran_id, saved.tranId);
-  assert.match(sent.ipn_url, /\/api\/payments\/ipn$/);
 });
 
-test("initiation: another customer's booking looks like 'not found'", async () => {
+test("checkout: another customer's booking is 'not found'; bad ids are rejected", async () => {
   const id = await newBooking();
-  const r = await initiate(id, {}, OTHER);
-  assert.equal(r.status, 404);
+  assert.equal((await checkout(id, OTHER)).status, 404);
+  assert.equal((await run(createCheckoutSession, { user: CUSTOMER, body: { bookingId: { $ne: "x" } } })).status, 404);
+  assert.equal((await run(createCheckoutSession, { user: CUSTOMER, body: {} })).status, 404);
   assert.equal(await paymentFor(id), null);
-  assert.equal(calls.length, 0);
+  assert.equal(created.length, 0);
 });
 
-test("initiation: ineligible bookings are rejected (not completed, already paid, no finalAmount, bad id)", async () => {
-  for (const overrides of [{ status: "in_progress" }, { status: "requested" }, { paymentStatus: "paid" }, { finalAmount: undefined }, { finalAmount: 0 }]) {
+test("checkout: only completed + unpaid bookings can be paid", async () => {
+  for (const overrides of [{ status: "requested" }, { status: "accepted" }, { status: "in_progress" }, { status: "cancelled" }, { paymentStatus: "paid" }, { finalAmount: undefined }, { finalAmount: 0 }, { finalAmount: 0.2 }]) {
     const id = await newBooking(overrides);
-    assert.equal((await initiate(id)).status, 409, JSON.stringify(overrides));
+    assert.equal((await checkout(id)).status, 409, JSON.stringify(overrides));
     assert.equal(await paymentFor(id), null);
   }
-  assert.equal((await run(initiatePayment, { user: CUSTOMER, body: { bookingId: { $ne: "x" } } })).status, 404);
-  assert.equal(calls.length, 0);
+  assert.equal(created.length, 0);
 });
 
-test("initiation: a second active attempt for the same booking is prevented", async () => {
+test("checkout: duplicate attempts reuse the open session; a paid booking cannot be paid again", async () => {
   const id = await newBooking();
-  assert.equal((await initiate(id)).status, 201);
-  assert.equal((await initiate(id)).status, 409);
+  const first = await checkout(id);
+  const second = await checkout(id);
+  assert.equal(second.status, 200);
+  assert.equal(second.body.url, first.body.url);
+  assert.equal(created.length, 1);
   assert.equal(await db.collection("payments").countDocuments({ bookingId: id }), 1);
+
+  markPaidAtStripe(first.body.sessionId);
+  assert.equal((await verify(first.body.sessionId)).status, 200);
+  assert.equal((await checkout(id)).status, 409);
 });
 
-test("initiation: stays closed when the sandbox settings are missing or not sandbox", async () => {
+test("checkout: simultaneous requests create only one session", async () => {
   const id = await newBooking();
-  process.env.SSLCOMMERZ_SANDBOX = "false";
-  assert.equal((await initiate(id)).status, 503);
-  process.env.SSLCOMMERZ_SANDBOX = "true";
-  assert.equal(calls.length, 0);
+  const results = await Promise.all([checkout(id), checkout(id), checkout(id)]);
+  assert.equal(results.filter((r) => r.status === 201).length, 1);
+  assert.ok(results.every((r) => [201, 200, 409].includes(r.status)));
+  assert.equal(created.length, 1);
 });
 
-test("IPN: a valid, validated transaction marks the payment and the booking paid, once", async () => {
+test("checkout: an expired open session is replaced; a failed Stripe call is recorded and can be retried", async () => {
   const id = await newBooking();
-  await initiate(id);
+  const first = await checkout(id);
+  await db.collection("payments").updateOne({ bookingId: id }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+  const second = await checkout(id);
+  assert.equal(second.status, 201);
+  assert.notEqual(second.body.sessionId, first.body.sessionId);
+
+  const id2 = await newBooking();
+  const original = mock.checkout.sessions.create;
+  mock.checkout.sessions.create = async () => { throw new Error("stripe down"); };
+  assert.equal((await checkout(id2)).status, 502);
+  assert.equal((await paymentFor(id2)).paymentStatus, "failed");
+  mock.checkout.sessions.create = original;
+  assert.equal((await checkout(id2)).status, 201);
+});
+
+test("checkout: refuses without a Stripe TEST key (live keys are never used)", async () => {
+  const id = await newBooking();
+  useStripe(undefined);
+  const key = process.env.STRIPE_SECRET_KEY;
+  process.env.STRIPE_SECRET_KEY = "sk_live_should_never_work";
+  assert.equal((await checkout(id)).status, 503);
+  delete process.env.STRIPE_SECRET_KEY;
+  assert.equal((await checkout(id)).status, 503);
+  process.env.STRIPE_SECRET_KEY = key;
+  useStripe(mock);
+  assert.equal(created.length, 0);
+});
+
+// ---- verification ----
+
+test("verify: a paid session marks the booking and payment paid, and keeps customer/service/technician details", async () => {
+  const id = await newBooking();
+  const { body } = await checkout(id);
+  markPaidAtStripe(body.sessionId);
+
+  const r = await verify(body.sessionId);
+  assert.equal(r.status, 200);
   const payment = await paymentFor(id);
-  goodValidation(payment);
-
-  const first = await ipn(payment);
-  assert.equal(first.status, 200);
-  const paid = await paymentFor(id);
-  assert.equal(paid.status, "paid");
-  assert.equal(paid.bankTranId, "BANK1");
+  assert.equal(payment.paymentStatus, "paid");
+  assert.equal(payment.transactionId, remote[body.sessionId].payment_intent);
+  assert.equal(payment.stripeSessionId, body.sessionId);
+  assert.equal(payment.amount, 75.5);
+  assert.equal(payment.currency, "usd");
+  assert.ok(payment.paidAt instanceof Date);
+  assert.equal(payment.customerId, CUSTOMER.id);
+  assert.equal(payment.customerEmail, CUSTOMER.email);
+  assert.equal(payment.serviceTitle, "FM TEST pay service");
+  assert.equal(payment.technicianEmail, "fm-test-tech@example.test");
+  assert.equal(payment.technicianName, "Test Technician");
+  assert.equal(payment.checkoutUrl, undefined);
   assert.equal((await booking(id)).paymentStatus, "paid");
-  assert.ok(calls.some((c) => c.url.includes("validationserverAPI.php") && c.url.includes("val_id=VAL1")));
-  const paidAt = paid.paidAt;
+  assert.equal(r.body.payment.status, "paid");
+});
+
+test("verify: repeating the verification is idempotent (one record, same paidAt)", async () => {
+  const id = await newBooking();
+  const { body } = await checkout(id);
+  markPaidAtStripe(body.sessionId);
+  await verify(body.sessionId);
+  const first = await paymentFor(id);
   const bookingPaidAt = (await booking(id)).paidAt;
 
-  // repeated IPN: no second validation call, nothing changes
-  const callsBefore = calls.length;
-  const again = await ipn(payment);
+  const again = await verify(body.sessionId);
   assert.equal(again.status, 200);
-  assert.equal(calls.length, callsBefore);
-  assert.deepEqual((await paymentFor(id)).paidAt, paidAt);
-  assert.deepEqual((await booking(id)).paidAt, bookingPaidAt);
   assert.equal(await db.collection("payments").countDocuments({ bookingId: id }), 1);
+  assert.deepEqual((await paymentFor(id)).paidAt, first.paidAt);
+  assert.deepEqual((await booking(id)).paidAt, bookingPaidAt);
 });
 
-test("IPN: wrong transaction id, amount, currency or validation status is rejected", async () => {
-  const cases = [
-    ["transaction id", { tran_id: "FM-someone-else" }],
-    ["amount", { amount: "1.00" }],
-    ["currency type", { currency_type: "USD" }],
-    ["currency", { currency: "USD" }],
-    ["missing currency_type", { currency_type: undefined }],
-    ["validation id", { val_id: "SOMETHING-ELSE" }],
-    ["validation status", { status: "INVALID_TRANSACTION" }],
-    ["validation status", { status: "FAILED" }],
-  ];
-  for (const [name, fields] of cases) {
-    const id = await newBooking();
-    await initiate(id);
-    const payment = await paymentFor(id);
-    goodValidation(payment, fields);
-    const r = await ipn(payment);
-    assert.equal(r.status, 400, name);
-    assert.equal((await paymentFor(id)).status, "pending", name);
-    assert.equal((await booking(id)).paymentStatus, "unpaid", name);
-  }
-});
-
-test("IPN: unknown transaction and a forged 'VALID' status without real validation are rejected", async () => {
-  assert.equal((await run(handleIpn, { body: { tran_id: "FM-does-not-exist", val_id: "X", status: "VALID" } })).status, 400);
-  assert.equal((await run(handleIpn, { body: {} })).status, 400);
-
+test("verify: unpaid sessions, invalid ids, other customers' sessions and Stripe errors change nothing", async () => {
   const id = await newBooking();
-  await initiate(id);
-  const payment = await paymentFor(id);
-  goodValidation(payment, { status: "INVALID_TRANSACTION" }); // the gateway says it is not real
-  assert.equal((await ipn(payment, { amount: "1500.00", currency: "BDT" })).status, 400);
+  const { body } = await checkout(id);
+
+  assert.equal((await verify(body.sessionId)).status, 402); // Stripe says "unpaid"
+  assert.equal((await verify("not-a-session")).status, 400);
+  assert.equal((await verify("cs_test_doesnotexist")).status, 404); // not one of our checkouts
+  assert.equal((await run(verifyPayment, { user: CUSTOMER, query: {} })).status, 400);
+  assert.equal((await run(verifyPayment, { user: CUSTOMER, query: { session_id: { $ne: "x" } } })).status, 400);
+
+  markPaidAtStripe(body.sessionId);
+  assert.equal((await verify(body.sessionId, OTHER)).status, 404); // someone else's session
+  delete remote[body.sessionId]; // Stripe does not know it (or is unreachable)
+  assert.equal((await verify(body.sessionId)).status, 502);
+
+  assert.equal((await paymentFor(id)).paymentStatus, "pending");
   assert.equal((await booking(id)).paymentStatus, "unpaid");
 });
 
-test("IPN: a risky transaction is held for review, never paid automatically", async () => {
-  for (const risk of ["1", undefined]) {
+test("verify: amount, currency, booking metadata, customer metadata and booking status must all match", async () => {
+  const cases = [
+    ["amount", { amount_total: 100 }],
+    ["currency", { currency: "eur" }],
+    ["booking metadata", { metadata: { bookingId: new ObjectId().toString(), customerEmail: CUSTOMER.email } }],
+    ["customer metadata", { metadata: { customerEmail: "someone@else.test" } }],
+    ["mode", { mode: "subscription" }],
+    ["payment intent", { payment_intent: null }],
+  ];
+  for (const [name, change] of cases) {
     const id = await newBooking();
-    await initiate(id);
-    const payment = await paymentFor(id);
-    goodValidation(payment, { risk_level: risk });
-    const r = await ipn(payment);
-    assert.equal(r.status, 200);
-    const held = await paymentFor(id);
-    assert.equal(held.status, "pending");
-    assert.equal(held.reviewRequired, true);
-    assert.equal((await booking(id)).paymentStatus, "unpaid");
+    const { body } = await checkout(id);
+    markPaidAtStripe(body.sessionId, { ...change, metadata: { ...remote[body.sessionId].metadata, ...change.metadata } });
+    assert.equal((await verify(body.sessionId)).status, 409, name);
+    assert.equal((await paymentFor(id)).paymentStatus, "pending", name);
+    assert.equal((await booking(id)).paymentStatus, "unpaid", name);
   }
-});
 
-test("IPN: failed / cancelled notifications never mark the booking paid", async () => {
-  for (const [ipnStatus, expected] of [["FAILED", "failed"], ["CANCELLED", "cancelled"], ["EXPIRED", "failed"]]) {
-    const id = await newBooking();
-    await initiate(id);
-    const payment = await paymentFor(id);
-    const r = await ipn(payment, { status: ipnStatus });
-    assert.equal(r.status, 200);
-    assert.equal((await paymentFor(id)).status, expected);
-    assert.equal((await booking(id)).paymentStatus, "unpaid");
-    assert.ok(!calls.some((c) => c.url.includes("validationserverAPI.php")));
-    // a closed attempt lets the customer try again
-    assert.equal((await initiate(id)).status, 201);
-  }
-});
-
-test("IPN: a paid booking cannot be paid twice", async () => {
   const id = await newBooking();
-  await initiate(id);
-  const first = await paymentFor(id);
-  await db.collection("payments").updateOne({ _id: first._id }, { $set: { status: "failed" } }); // allow a second attempt
-  await initiate(id);
-  const second = await db.collection("payments").findOne({ bookingId: id, status: "pending" });
+  const { body } = await checkout(id);
+  await db.collection("bookings").updateOne({ _id: id }, { $set: { status: "in_progress" } });
+  markPaidAtStripe(body.sessionId);
+  assert.equal((await verify(body.sessionId)).status, 409);
+  assert.equal((await booking(id)).paymentStatus, "unpaid");
+});
 
-  goodValidation(second);
-  await ipn(second);
+test("verify: a second paid session for an already-paid booking is flagged for refund, not double-counted", async () => {
+  const id = await newBooking();
+  const first = (await checkout(id)).body;
+  await db.collection("payments").updateOne({ stripeSessionId: first.sessionId }, { $set: { paymentStatus: "cancelled" } });
+  const second = (await checkout(id)).body; // a customer who paid in two tabs
+  markPaidAtStripe(second.sessionId);
+  assert.equal((await verify(second.sessionId)).status, 200);
+
+  markPaidAtStripe(first.sessionId);
+  assert.equal((await verify(first.sessionId)).status, 409);
+  const flagged = await db.collection("payments").findOne({ stripeSessionId: first.sessionId });
+  assert.equal(flagged.paymentStatus, "failed");
+  assert.equal(flagged.reviewRequired, true);
+  assert.equal(await db.collection("payments").countDocuments({ bookingId: id, paymentStatus: "paid" }), 1);
+});
+
+// ---- webhook ----
+
+test("webhook: a correctly signed paid event marks the booking paid; duplicate events change nothing", async () => {
+  const id = await newBooking();
+  const { body } = await checkout(id);
+  markPaidAtStripe(body.sessionId);
+  const event = sessionEvent("checkout.session.completed", body.sessionId);
+
+  assert.equal((await webhook(event)).status, 200);
+  const paid = await paymentFor(id);
+  assert.equal(paid.paymentStatus, "paid");
+  assert.equal(paid.transactionId, remote[body.sessionId].payment_intent);
   assert.equal((await booking(id)).paymentStatus, "paid");
 
-  goodValidation(first);
-  const late = await ipn(first);
-  assert.equal(late.status, 200);
-  assert.equal((await db.collection("payments").findOne({ _id: first._id })).status, "failed");
-  assert.equal(await db.collection("payments").countDocuments({ bookingId: id, status: "paid" }), 1);
+  assert.equal((await webhook(event)).status, 200); // Stripe redelivers
+  assert.equal((await webhook(sessionEvent("checkout.session.async_payment_succeeded", body.sessionId))).status, 200);
+  assert.equal(await db.collection("payments").countDocuments({ bookingId: id }), 1);
+  assert.deepEqual((await paymentFor(id)).paidAt, paid.paidAt);
+
+  // the redirect-based verification afterwards is also a no-op
+  assert.equal((await verify(body.sessionId)).status, 200);
+  assert.equal(await db.collection("payments").countDocuments({ bookingId: id }), 1);
 });
 
-test("history: a customer sees only their own payments, with safe fields", async () => {
+test("webhook: missing, forged, wrong-secret and tampered signatures are rejected and change nothing", async () => {
+  const id = await newBooking();
+  const { body } = await checkout(id);
+  markPaidAtStripe(body.sessionId);
+  const event = sessionEvent("checkout.session.completed", body.sessionId);
+  const raw = Buffer.from(JSON.stringify(event));
+
+  assert.equal((await run(handleWebhook, { body: raw, headers: {} })).status, 400);
+  assert.equal((await run(handleWebhook, { body: raw, headers: { "stripe-signature": "t=1,v1=deadbeef" } })).status, 400);
+  assert.equal((await webhook(event, { secret: "whsec_someone_else" })).status, 400);
+  assert.equal((await webhook(event, { tamper: true })).status, 400);
+  assert.equal((await run(handleWebhook, { body: event, headers: {} })).status, 400); // a parsed (non-raw) body
+
+  assert.equal((await paymentFor(id)).paymentStatus, "pending");
+  assert.equal((await booking(id)).paymentStatus, "unpaid");
+});
+
+test("webhook: events that are unpaid, unknown, or about a mismatching amount never mark a booking paid", async () => {
+  const id = await newBooking();
+  const { body } = await checkout(id);
+  // delayed payment method: completed but not yet paid
+  assert.equal((await webhook(sessionEvent("checkout.session.completed", body.sessionId))).status, 200);
+  assert.equal((await booking(id)).paymentStatus, "unpaid");
+
+  // a signed event about a session that is not ours
+  remote.cs_test_stranger = { id: "cs_test_stranger", mode: "payment", currency: "usd", payment_status: "paid", amount_total: 7550, payment_intent: "pi_x", metadata: { bookingId: id.toString(), customerEmail: CUSTOMER.email } };
+  assert.equal((await webhook(sessionEvent("checkout.session.completed", "cs_test_stranger"))).status, 200);
+  assert.equal((await booking(id)).paymentStatus, "unpaid");
+
+  // our session, but the paid amount is wrong
+  markPaidAtStripe(body.sessionId, { amount_total: 100 });
+  assert.equal((await webhook(sessionEvent("checkout.session.completed", body.sessionId))).status, 200);
+  assert.equal((await booking(id)).paymentStatus, "unpaid");
+  assert.equal((await paymentFor(id)).paymentStatus, "pending");
+});
+
+test("webhook: expired and failed sessions close the attempt (never paid) and allow a new checkout", async () => {
+  const id = await newBooking();
+  const { body } = await checkout(id);
+  assert.equal((await webhook(sessionEvent("checkout.session.expired", body.sessionId))).status, 200);
+  assert.equal((await paymentFor(id)).paymentStatus, "cancelled");
+  assert.equal((await booking(id)).paymentStatus, "unpaid");
+  assert.equal((await checkout(id)).status, 201);
+
+  const id2 = await newBooking();
+  const second = (await checkout(id2)).body;
+  assert.equal((await webhook(sessionEvent("checkout.session.async_payment_failed", second.sessionId))).status, 200);
+  assert.equal((await paymentFor(id2)).paymentStatus, "failed");
+  assert.equal((await booking(id2)).paymentStatus, "unpaid");
+});
+
+test("webhook: not configured -> 503", async () => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  delete process.env.STRIPE_WEBHOOK_SECRET;
+  assert.equal((await run(handleWebhook, { body: Buffer.from("{}"), headers: {} })).status, 503);
+  process.env.STRIPE_WEBHOOK_SECRET = secret;
+});
+
+// ---- history, admin, revenue ----
+
+test("history: a customer sees only their own payments", async () => {
   const mine = await newBooking();
   const theirs = await newBooking({ customerId: OTHER.id });
-  await initiate(mine);
-  await initiate(theirs, {}, OTHER);
+  await checkout(mine);
+  await checkout(theirs, OTHER);
 
   const r = await run(getMyPayments, { user: CUSTOMER });
   assert.equal(r.status, 200);
-  assert.ok(r.body.payments.length > 0);
-  assert.ok(r.body.payments.every((p) => p.bookingId !== theirs.toString()));
   assert.ok(r.body.payments.some((p) => p.bookingId === mine.toString()));
-  for (const p of r.body.payments) {
-    assert.deepEqual(Object.keys(p).sort(), ["amount", "bookingId", "createdAt", "currency", "id", "paidAt", "provider", "serviceTitle", "status", "tranId"]);
-  }
-  const otherList = await run(getMyPayments, { user: OTHER });
-  assert.ok(otherList.body.payments.every((p) => p.bookingId === theirs.toString()));
+  assert.ok(r.body.payments.every((p) => p.bookingId !== theirs.toString()));
+  for (const p of r.body.payments) assert.equal(p.checkoutUrl, undefined);
+  const other = await run(getMyPayments, { user: OTHER });
+  assert.ok(other.body.payments.every((p) => p.bookingId === theirs.toString()));
 });
 
-test("admin transactions: read real payment records without secrets", async () => {
+test("admin transactions: real payment records, filterable, without checkout links", async () => {
   const id = await newBooking();
-  await initiate(id);
-  const payment = await paymentFor(id);
-  goodValidation(payment);
-  await ipn(payment);
+  const { body } = await checkout(id);
+  markPaidAtStripe(body.sessionId);
+  await verify(body.sessionId);
 
   const r = await run(getTransactions, { user: { id: "fake-admin", role: "admin" }, query: { status: "paid", limit: "50" } });
   assert.equal(r.status, 200);
   const row = r.body.transactions.find((t) => t.bookingId === id.toString());
-  assert.equal(row.status, "paid");
-  assert.equal(row.amount, 1500);
-  assert.equal(row.currency, "BDT");
-  assert.equal(row.valId, undefined);
-  assert.equal(row.sessionKey, undefined);
-  assert.ok(r.body.transactions.every((t) => t.status === "paid"));
+  assert.equal(row.paymentStatus, "paid");
+  assert.equal(row.amount, 75.5);
+  assert.equal(row.currency, "usd");
+  assert.equal(row.transactionId, remote[body.sessionId].payment_intent);
+  assert.equal(row.checkoutUrl, undefined);
+  assert.ok(r.body.transactions.every((t) => t.paymentStatus === "paid"));
 });
 
-test("HTTP: admin transactions need an admin; payment routes need a customer token", async () => {
+test("revenue: counts only genuinely paid payments, never unpaid completed bookings or open checkouts", async () => {
+  const revenue = async () => (await run(getStats, { user: { id: "fake-admin", role: "admin" } })).body.revenue;
+  const base = await revenue();
+
+  const unpaid = await newBooking({ finalAmount: 7000 }); // completed but unpaid
+  assert.equal(await revenue(), base);
+  const open = (await checkout(unpaid)).body; // checkout started, not paid
+  assert.equal(await revenue(), base);
+  await webhook(sessionEvent("checkout.session.expired", open.sessionId));
+  assert.equal(await revenue(), base);
+
+  const other = await newBooking({ finalAmount: 20 });
+  const { body } = await checkout(other);
+  markPaidAtStripe(body.sessionId);
+  await verify(body.sessionId);
+  assert.equal(await revenue(), base + 20);
+  await verify(body.sessionId); // repeating does not double count
+  assert.equal(await revenue(), base + 20);
+});
+
+// ---- HTTP (needs the running server) ----
+
+test("HTTP: payment and admin routes enforce authentication; the webhook works with the raw body", async () => {
   const ask = (method, path, token, body) =>
     fetch(`${API_URL}${path}`, {
       method,
@@ -308,111 +441,29 @@ test("HTTP: admin transactions need an admin; payment routes need a customer tok
     body: JSON.stringify({ email: mailbox, password: "Test-pass-12345", name: "FM Pay Http" }),
   });
   const cookie = signUp.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
-  const { token } = await (await fetch(`${AUTH_URL}/api/auth/token`, { headers: { Cookie: cookie, Origin: ORIGIN } })).json();
   const userId = (await signUp.json().catch(() => null))?.user?.id;
+  const { token } = await (await fetch(`${AUTH_URL}/api/auth/token`, { headers: { Cookie: cookie, Origin: ORIGIN } })).json();
 
   assert.equal(await ask("GET", "/api/admin/transactions"), 401);
-  assert.equal(await ask("GET", "/api/admin/transactions", token), 403); // customer, not admin
+  assert.equal(await ask("GET", "/api/admin/transactions", token), 403); // a customer is not an admin
+  assert.equal(await ask("POST", "/api/payments/create-checkout-session", null, { bookingId: "x" }), 401);
+  assert.equal(await ask("GET", "/api/payments/verify?session_id=cs_test_x"), 401);
   assert.equal(await ask("GET", "/api/payments/my"), 401);
-  assert.equal(await ask("POST", "/api/payments/initiate", null, { bookingId: "x" }), 401);
-  assert.equal(await ask("GET", "/api/payments/my", token), 200); // a customer sees their (empty) history
+  assert.equal(await ask("GET", "/api/payments/my", token), 200);
 
-  // the IPN is public but unsigned notifications are refused, and browser redirects change nothing
-  // (503 when the server has no SSLCommerz settings, 400 when it does: unsigned notifications never succeed)
-  assert.ok([400, 503].includes(await ask("POST", "/api/payments/ipn", null, { tran_id: "FM-none" })));
-  const redirect = await fetch(`${API_URL}/api/payments/success`, { method: "POST", redirect: "manual" });
-  assert.equal(redirect.status, 303);
-  assert.match(redirect.headers.get("location"), /payment=success$/);
+  // the webhook is public, but an unsigned request is refused (400 once Stripe is configured, 503 before)
+  assert.ok([400, 503].includes(await ask("POST", "/api/payments/webhook", null, { type: "checkout.session.completed" })));
+
+  // a correctly signed event for a session we do not know is acknowledged (200) when the server shares the
+  // test secrets, which proves the raw body reaches the signature check intact
+  const payload = JSON.stringify({ id: "evt_fm_http", object: "event", type: "checkout.session.expired", data: { object: { id: "cs_test_unknown" } } });
+  const signed = await fetch(`${API_URL}/api/payments/webhook`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "stripe-signature": stripeLib.webhooks.generateTestHeaderString({ payload, secret: process.env.STRIPE_WEBHOOK_SECRET }) },
+    body: payload,
+  });
+  assert.ok([200, 400, 503].includes(signed.status));
+  if (process.env.EXPECT_WEBHOOK_200) assert.equal(signed.status, 200);
+
   await db.collection("account").deleteMany({ userId: userId ?? mailbox });
-});
-
-// ---- IPN integrity (verify_sign / verify_key) ----
-
-test("IPN integrity: a correctly signed notification is accepted; the signature alone never marks paid", async () => {
-  const id = await newBooking();
-  await initiate(id);
-  const payment = await paymentFor(id);
-
-  // Valid signature, but the Order Validation API says no -> still unpaid
-  goodValidation(payment, { status: "INVALID_TRANSACTION" });
-  assert.equal((await ipn(payment)).status, 400);
-  assert.equal((await booking(id)).paymentStatus, "unpaid");
-
-  // Valid signature AND valid Order Validation -> paid
-  goodValidation(payment);
-  assert.equal((await ipn(payment)).status, 200);
-  assert.equal((await booking(id)).paymentStatus, "paid");
-});
-
-test("IPN integrity: missing, forged, wrong-password or tampered signatures are rejected without side effects", async () => {
-  const id = await newBooking();
-  await initiate(id);
-  const payment = await paymentFor(id);
-  goodValidation(payment);
-  const good = ipnBody(payment);
-  const bad = {
-    "no signature": (({ verify_sign, ...rest }) => rest)(good),
-    "no verify_key": (({ verify_key, ...rest }) => rest)(good),
-    "forged signature": { ...good, verify_sign: "0".repeat(32) },
-    "wrong store password": ipnBody(payment) && sign({ tran_id: payment.tranId, val_id: "VAL1", status: "VALID", amount: "1500.00", currency: "BDT" }, "not-the-password"),
-    "amount changed after signing": { ...good, amount: "1.00" },
-    "tran_id changed after signing": { ...good, tran_id: "FM-other" },
-    "signature does not cover tran_id": sign({ val_id: "VAL1", status: "VALID", amount: "1500.00" }),
-    "not strings": { ...good, verify_sign: { $ne: "x" } },
-  };
-  for (const [name, body] of Object.entries(bad)) {
-    const r = await run(handleIpn, { body: { ...body, tran_id: body.tran_id ?? payment.tranId } });
-    assert.equal(r.status, 400, name);
-  }
-  assert.equal((await run(handleIpn, { body: undefined })).status, 400);
-  assert.equal((await paymentFor(id)).status, "pending");
-  assert.equal((await booking(id)).paymentStatus, "unpaid");
-  assert.ok(!calls.some((c) => c.url.includes("validationserverAPI.php")), "no validation call for an unsigned notification");
-
-  // an unsigned FAILED notification must not close the attempt either
-  const unsigned = await run(handleIpn, { body: { tran_id: payment.tranId, status: "CANCELLED" } });
-  assert.equal(unsigned.status, 400);
-  assert.equal((await paymentFor(id)).status, "pending");
-});
-
-test("IPN integrity: the signature follows the documented algorithm (fixed vector)", async () => {
-  const { verifyIpnSignature } = await import("../config/sslcommerz.js");
-  const fields = { tran_id: "T1", val_id: "V1", status: "VALID", amount: "10.00" };
-  const text = `amount=10.00&status=VALID&store_passwd=${createHash("md5").update("fm_test_password").digest("hex")}&tran_id=T1&val_id=V1`;
-  const body = { ...fields, verify_key: "tran_id,val_id,status,amount", verify_sign: createHash("md5").update(text).digest("hex") };
-  assert.equal(verifyIpnSignature(body), true);
-  assert.equal(verifyIpnSignature({ ...body, amount: "11.00" }), false);
-});
-
-// ---- Revenue ----
-
-test("revenue: counts verified paid payments only, never completed-but-unpaid bookings", async () => {
-  const revenue = async () => (await run(getStats, { user: { id: "fake-admin", role: "admin" } })).body.revenue;
-  const base = await revenue();
-
-  // completed, unpaid booking with a large finalAmount: no revenue
-  const unpaid = await newBooking({ finalAmount: 7000 });
-  assert.equal(await revenue(), base);
-
-  // pending, failed and risky payments: no revenue
-  await initiate(unpaid);
-  assert.equal(await revenue(), base);
-  const pending = await paymentFor(unpaid);
-  goodValidation(pending, { risk_level: "1" });
-  await ipn(pending);
-  assert.equal(await revenue(), base);
-  await ipn(pending, { status: "FAILED" });
-  assert.equal(await revenue(), base);
-
-  // a verified paid payment: revenue grows by exactly its amount
-  const other = await newBooking({ finalAmount: 1250 });
-  await initiate(other);
-  const payment = await paymentFor(other);
-  goodValidation(payment);
-  await ipn(payment);
-  assert.equal(await revenue(), base + 1250);
-
-  // repeating the IPN does not double count
-  await ipn(payment);
-  assert.equal(await revenue(), base + 1250);
 });

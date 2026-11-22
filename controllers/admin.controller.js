@@ -34,10 +34,10 @@ export const getStats = async (req, res) => {
     countBy("user", "role", ROLES),
     countBy("services", "status", SERVICE_STATUSES),
     countByStatus({}),
-    // Revenue is only money that SSLCommerz validated (payments marked "paid"), never completed-but-unpaid work
+    // Revenue is only money Stripe confirmed (payments marked "paid"), never completed-but-unpaid work
     db
       .collection("payments")
-      .aggregate([{ $match: { status: "paid" } }, { $group: { _id: null, total: { $sum: "$amount" } } }])
+      .aggregate([{ $match: { paymentStatus: "paid" } }, { $group: { _id: null, total: { $sum: "$amount" } } }])
       .toArray(),
   ]);
 
@@ -146,12 +146,12 @@ export const getAllBookings = async (req, res) => {
 // Real payment records (not bookings). Safe fields only: no session key, validation id or provider data.
 export const getTransactions = async (req, res) => {
   const { page, limit } = paging(req.query);
-  const filter = PAYMENT_STATUSES.includes(req.query.status) ? { status: req.query.status } : {};
+  const filter = PAYMENT_STATUSES.includes(req.query.status) ? { paymentStatus: req.query.status } : {};
 
   const payments = db.collection("payments");
   const [items, total] = await Promise.all([
     payments
-      .find(filter, { projection: { sessionKey: 0, valId: 0 } })
+      .find(filter, { projection: { checkoutUrl: 0, expiresAt: 0 } })
       .sort({ createdAt: -1, _id: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
@@ -160,7 +160,13 @@ export const getTransactions = async (req, res) => {
   ]);
 
   res.json({
-    transactions: items.map(({ _id, bookingId, ...payment }) => ({ id: _id.toString(), bookingId: bookingId.toString(), ...payment })),
+    transactions: items.map(({ _id, bookingId, ...payment }) => ({
+      id: _id.toString(),
+      bookingId: bookingId.toString(),
+      ...payment,
+      status: payment.paymentStatus, // same value the dashboard already reads
+      provider: "Stripe",
+    })),
     total,
     page,
     limit,

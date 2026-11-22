@@ -1,38 +1,42 @@
-import { randomUUID } from "node:crypto";
 import { ObjectId } from "mongodb";
 import { client, db } from "../config/db.js";
-import { CURRENCY, backendUrl, createSession, isConfigured, validateTransaction, verifyIpnSignature } from "../config/sslcommerz.js";
+import { getStripe, isConfigured } from "../config/stripe.js";
 import { text } from "./booking.controller.js";
 import { paging } from "./admin.controller.js";
 
+const CURRENCY = "usd";
 const PAYMENT_STATUSES = ["pending", "paid", "failed", "cancelled"];
 const ID_PATTERN = /^[a-f\d]{24}$/i;
-// A pending attempt older than this is treated as abandoned so the customer can try again
-const STALE_AFTER_MS = 30 * 60 * 1000;
+const SESSION_ID = /^cs_test_[A-Za-z0-9_]+$/;
+// Stripe needs a Checkout Session to live at least 30 minutes; also the minimum card charge is $0.50
+const SESSION_MINUTES = 31;
+const MIN_CENTS = 50;
 
 const payments = () => db.collection("payments");
 const bookings = () => db.collection("bookings");
-const money = (value) => Number(value).toFixed(2);
+const toCents = (dollars) => Math.round(dollars * 100);
 
-// Safe public shape: never includes the session key, validation id or raw provider data
-export const toPayment = ({ _id, bookingId, ...payment }) => ({
+// Safe public shape. `status`, `tranId` and `provider` repeat the fields the dashboard already reads.
+export const toPayment = ({ _id, bookingId, ...p }) => ({
   id: _id.toString(),
   bookingId: bookingId.toString(),
-  tranId: payment.tranId,
-  serviceTitle: payment.serviceTitle,
-  amount: payment.amount,
-  currency: payment.currency,
-  provider: payment.provider,
-  status: payment.status,
-  createdAt: payment.createdAt,
-  paidAt: payment.paidAt ?? null,
+  serviceTitle: p.serviceTitle,
+  amount: p.amount,
+  currency: p.currency,
+  provider: "Stripe",
+  paymentStatus: p.paymentStatus,
+  status: p.paymentStatus,
+  transactionId: p.transactionId ?? null,
+  tranId: p.transactionId ?? p.stripeSessionId ?? null,
+  stripeSessionId: p.stripeSessionId ?? null,
+  createdAt: p.createdAt,
+  paidAt: p.paidAt ?? null,
 });
 
-// Thrown inside the transaction to roll it back
 class Rollback extends Error {}
 
-// POST /api/payments/initiate  { bookingId }  (customer). Amount and currency come only from the database.
-export const initiatePayment = async (req, res) => {
+// POST /api/payments/create-checkout-session  { bookingId }. The amount is read from the booking, never the client.
+export const createCheckoutSession = async (req, res) => {
   if (!isConfigured()) return res.status(503).json({ message: "Online payment is not available right now" });
 
   const bookingId = text(req.body?.bookingId);
@@ -45,77 +49,216 @@ export const initiatePayment = async (req, res) => {
     booking.status === "completed" &&
     booking.paymentStatus === "unpaid" &&
     typeof booking.finalAmount === "number" &&
-    booking.finalAmount > 0;
+    toCents(booking.finalAmount) >= MIN_CENTS;
   if (!payable) return res.status(409).json({ message: "This booking is not ready for payment" });
 
   const now = new Date();
   await payments().updateMany(
-    { bookingId: booking._id, status: "pending", createdAt: { $lt: new Date(now - STALE_AFTER_MS) } },
-    { $set: { status: "cancelled", failureReason: "Payment attempt expired", updatedAt: now } }
+    { bookingId: booking._id, paymentStatus: "pending", expiresAt: { $lt: now } },
+    { $set: { paymentStatus: "cancelled", failureReason: "Checkout session expired", updatedAt: now } }
   );
 
+  // One open checkout per booking: hand back the existing one instead of creating a second
+  const open = await payments().findOne({ bookingId: booking._id, paymentStatus: "pending" });
+  if (open) {
+    if (!open.checkoutUrl) return res.status(409).json({ message: "A payment for this booking is already starting" });
+    return res.json({ url: open.checkoutUrl, sessionId: open.stripeSessionId, reused: true });
+  }
+
   const payment = {
-    tranId: `FM-${randomUUID()}`,
     bookingId: booking._id,
     customerId: req.user.id,
     customerName: req.user.name ?? "",
     customerEmail: req.user.email ?? "",
-    technicianEmail: booking.technicianEmail ?? null,
+    serviceId: booking.serviceId,
     serviceTitle: booking.serviceTitle,
+    technicianName: booking.technicianName ?? booking.technician ?? null,
+    technicianEmail: booking.technicianEmail ?? null,
     amount: booking.finalAmount,
     currency: CURRENCY,
-    provider: "SSLCommerz",
-    status: "pending",
+    paymentStatus: "pending",
+    expiresAt: new Date(now.getTime() + SESSION_MINUTES * 60 * 1000),
     createdAt: now,
     updatedAt: now,
   };
 
-  // The unique partial index allows only one pending payment per booking
+  // The unique partial index allows only one pending payment per booking, even for simultaneous requests
   let insertedId;
   try {
     ({ insertedId } = await payments().insertOne(payment));
   } catch (error) {
     if (error.code === 11000) {
-      return res.status(409).json({ message: "A payment for this booking is already in progress" });
+      return res.status(409).json({ message: "A payment for this booking is already starting" });
     }
     throw error;
   }
 
   try {
-    const api = backendUrl();
-    const { gatewayUrl, sessionKey } = await createSession({
-      total_amount: money(payment.amount),
-      tran_id: payment.tranId,
-      success_url: `${api}/api/payments/success`,
-      fail_url: `${api}/api/payments/fail`,
-      cancel_url: `${api}/api/payments/cancel`,
-      ipn_url: `${api}/api/payments/ipn`,
-      product_name: booking.serviceTitle,
-      product_category: booking.category || "Repair service",
-      cus_name: payment.customerName || "Customer",
-      cus_email: payment.customerEmail,
-      cus_add1: booking.address || "N/A",
-      cus_city: "Dhaka",
-      cus_country: "Bangladesh",
-      cus_phone: booking.phone,
+    const session = await getStripe().checkout.sessions.create({
+      mode: "payment",
+      customer_email: payment.customerEmail || undefined,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: CURRENCY,
+            unit_amount: toCents(booking.finalAmount),
+            product_data: { name: booking.serviceTitle },
+          },
+        },
+      ],
+      metadata: { bookingId: booking._id.toString(), customerEmail: payment.customerEmail },
+      expires_at: Math.floor(payment.expiresAt.getTime() / 1000),
+      success_url: `${process.env.FRONTEND_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/payment/cancel`,
     });
 
-    await payments().updateOne({ _id: insertedId }, { $set: { sessionKey, updatedAt: new Date() } });
-    res.status(201).json({ paymentId: insertedId.toString(), tranId: payment.tranId, gatewayUrl });
-  } catch (error) {
-    console.error("SSLCommerz session error:", error.message);
     await payments().updateOne(
-      { _id: insertedId, status: "pending" },
-      { $set: { status: "failed", failureReason: "Could not start the payment session", updatedAt: new Date() } }
+      { _id: insertedId },
+      { $set: { stripeSessionId: session.id, checkoutUrl: session.url, updatedAt: new Date() } }
+    );
+    res.status(201).json({ url: session.url, sessionId: session.id });
+  } catch (error) {
+    console.error("Stripe checkout session error:", error.message);
+    await payments().updateOne(
+      { _id: insertedId, paymentStatus: "pending" },
+      { $set: { paymentStatus: "failed", failureReason: "Could not start the checkout", updatedAt: new Date() } }
     );
     res.status(502).json({ message: "Could not start the payment. Please try again." });
   }
 };
 
+// Shared by the verify endpoint and the webhook. Marks the payment and booking paid only when the Stripe session
+// (always fetched from, or signed by, Stripe) agrees with our own records. Safe to repeat.
+// Returns { ok: true, payment } or { ok: false, unpaid?: true, reason }.
+export const settleSession = async (session) => {
+  const payment = await payments().findOne({ stripeSessionId: session.id });
+  if (!payment) return { ok: false, reason: "unknown session" };
+  if (payment.paymentStatus === "paid") return { ok: true, payment };
+  if (session.payment_status !== "paid") return { ok: false, unpaid: true, reason: "not paid" };
+
+  const intentId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id;
+  const booking = await bookings().findOne({ _id: payment.bookingId, customerId: payment.customerId });
+
+  const problem =
+    (session.mode !== "payment" && "mode") ||
+    (session.currency !== CURRENCY && "currency") ||
+    (!intentId && "payment intent") ||
+    (session.metadata?.bookingId !== payment.bookingId.toString() && "booking metadata") ||
+    (session.metadata?.customerEmail !== payment.customerEmail && "customer metadata") ||
+    (!booking && "booking") ||
+    (booking.status !== "completed" && "booking status") ||
+    (session.amount_total !== toCents(booking.finalAmount) && "amount") ||
+    (session.amount_total !== toCents(payment.amount) && "payment amount");
+  if (problem) {
+    console.error(`Stripe session ${session.id} rejected: ${problem} mismatch`);
+    return { ok: false, reason: problem };
+  }
+
+  // Atomic: the booking and the payment both change, or neither does
+  const dbSession = client.startSession();
+  let paidAt;
+  try {
+    await dbSession.withTransaction(async () => {
+      paidAt = new Date();
+      const updatedBooking = await bookings().updateOne(
+        { _id: payment.bookingId, customerId: payment.customerId, paymentStatus: "unpaid" },
+        { $set: { paymentStatus: "paid", paidAt, updatedAt: paidAt } },
+        { session: dbSession }
+      );
+      if (!updatedBooking.matchedCount) throw new Rollback("booking");
+
+      const updatedPayment = await payments().updateOne(
+        { stripeSessionId: session.id, paymentStatus: { $in: ["pending", "cancelled", "failed"] } },
+        { $set: { paymentStatus: "paid", transactionId: intentId, paidAt, updatedAt: paidAt, failureReason: null }, $unset: { checkoutUrl: "" } },
+        { session: dbSession }
+      );
+      if (!updatedPayment.matchedCount) throw new Rollback("payment");
+    });
+  } catch (error) {
+    if (!(error instanceof Rollback)) throw error;
+    const latest = await payments().findOne({ stripeSessionId: session.id });
+    if (latest.paymentStatus === "paid") return { ok: true, payment: latest }; // another request finished first
+
+    // The booking was already paid through another session: keep a flagged record so the extra charge can be refunded
+    await payments().updateOne(
+      { stripeSessionId: session.id, paymentStatus: { $ne: "paid" } },
+      { $set: { paymentStatus: "failed", transactionId: intentId, reviewRequired: true, failureReason: "Duplicate payment: the booking was already paid. Refund required.", updatedAt: new Date() }, $unset: { checkoutUrl: "" } }
+    );
+    return { ok: false, reason: "booking already paid" };
+  } finally {
+    await dbSession.endSession();
+  }
+
+  return { ok: true, payment: await payments().findOne({ stripeSessionId: session.id }) };
+};
+
+// GET /api/payments/verify?session_id=...  (customer). Retrieves the session from Stripe itself.
+export const verifyPayment = async (req, res) => {
+  if (!isConfigured()) return res.status(503).json({ message: "Online payment is not available right now" });
+
+  const sessionId = text(req.query.session_id);
+  if (!SESSION_ID.test(sessionId)) return res.status(400).json({ message: "Invalid payment session" });
+
+  // Only the customer who started this checkout can verify it
+  const own = await payments().findOne({ stripeSessionId: sessionId, customerId: req.user.id });
+  if (!own) return res.status(404).json({ message: "Payment session not found" });
+
+  let session;
+  try {
+    session = await getStripe().checkout.sessions.retrieve(sessionId);
+  } catch (error) {
+    console.error("Stripe retrieve error:", error.message);
+    return res.status(502).json({ message: "Could not verify the payment. Please try again." });
+  }
+
+  const result = await settleSession(session);
+  if (result.unpaid) return res.status(402).json({ message: "Payment has not been completed", paymentStatus: session.payment_status });
+  if (!result.ok) return res.status(409).json({ message: "Payment could not be verified" });
+
+  res.json({ message: "Payment verified", payment: toPayment(result.payment) });
+};
+
+// POST /api/payments/webhook (public). Needs the RAW body (see index.js); trusted only after Stripe's signature check.
+export const handleWebhook = async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!isConfigured() || !secret) return res.status(503).json({ message: "Webhook is not configured" });
+
+  let event;
+  try {
+    event = getStripe().webhooks.constructEvent(req.body, req.headers["stripe-signature"], secret);
+  } catch {
+    return res.status(400).json({ message: "Invalid webhook signature" });
+  }
+
+  const session = event.data?.object;
+  const closeAttempt = (paymentStatus, failureReason) =>
+    payments().updateOne(
+      { stripeSessionId: session.id, paymentStatus: "pending" },
+      { $set: { paymentStatus, failureReason, updatedAt: new Date() }, $unset: { checkoutUrl: "" } }
+    );
+
+  switch (event.type) {
+    case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded":
+      // A completed session that is not "paid" yet (delayed payment methods) is ignored until it succeeds
+      if (session.payment_status === "paid") await settleSession(session);
+      break;
+    case "checkout.session.expired":
+      await closeAttempt("cancelled", "Checkout session expired");
+      break;
+    case "checkout.session.async_payment_failed":
+      await closeAttempt("failed", "Payment failed");
+      break;
+  }
+
+  res.json({ received: true });
+};
+
 export const getMyPayments = async (req, res) => {
   const { page, limit } = paging(req.query);
   const filter = { customerId: req.user.id };
-  if (PAYMENT_STATUSES.includes(req.query.status)) filter.status = req.query.status;
+  if (PAYMENT_STATUSES.includes(req.query.status)) filter.paymentStatus = req.query.status;
 
   const [items, total] = await Promise.all([
     payments()
@@ -128,112 +271,4 @@ export const getMyPayments = async (req, res) => {
   ]);
 
   res.json({ payments: items.map(toPayment), total, page, limit, totalPages: Math.ceil(total / limit) });
-};
-
-// POST /api/payments/ipn (public, called by SSLCommerz). The only place a payment can become "paid",
-// and only after the Order Validation API confirms it. The IPN's own status and amount are never trusted.
-export const handleIpn = async (req, res) => {
-  const body = req.body ?? {};
-  if (!isConfigured()) return res.status(503).json({ message: "Online payment is not available right now" });
-
-  // Step 1: integrity check of the notification itself (verify_sign / verify_key)
-  if (!verifyIpnSignature(body)) {
-    console.error("SSLCommerz IPN rejected: missing or invalid signature");
-    return res.status(400).json({ message: "Invalid notification" });
-  }
-
-  const tranId = text(body.tran_id);
-  const ipnStatus = text(body.status).toUpperCase();
-
-  const payment = tranId ? await payments().findOne({ tranId }) : null;
-  if (!payment) return res.status(400).json({ message: "Unknown transaction" });
-
-  // Repeated notifications change nothing
-  if (payment.status === "paid") return res.json({ message: "Already processed" });
-
-  // Failed / cancelled notifications only close a pending attempt; they can never mark anything paid
-  const closing = { FAILED: "failed", EXPIRED: "failed", CANCELLED: "cancelled" }[ipnStatus];
-  if (closing) {
-    await payments().updateOne(
-      { tranId, status: "pending" },
-      { $set: { status: closing, failureReason: `Gateway reported ${ipnStatus}`, updatedAt: new Date() } }
-    );
-    return res.json({ message: "Recorded" });
-  }
-  if (ipnStatus !== "VALID" && ipnStatus !== "VALIDATED") return res.json({ message: "Ignored" });
-
-  // Server-side validation with the val_id
-  const valId = text(body.val_id);
-  if (!valId) return res.status(400).json({ message: "Missing validation id" });
-
-  let result;
-  try {
-    result = await validateTransaction(valId);
-  } catch (error) {
-    console.error("SSLCommerz validation error:", error.message);
-    return res.status(502).json({ message: "Could not validate the transaction" });
-  }
-
-  // Step 2: Order Validation API. `currency_type` is the currency we sent at initiation and `currency` is the
-  // currency of `amount`; both must be BDT, and `amount` must equal the stored amount.
-  const problem =
-    (result.status !== "VALID" && result.status !== "VALIDATED" && "validation status") ||
-    (result.tran_id !== payment.tranId && "transaction id") ||
-    (result.val_id !== valId && "validation id") ||
-    (money(result.amount) !== money(payment.amount) && "amount") ||
-    (result.currency_type !== payment.currency && "currency type") ||
-    (result.currency !== payment.currency && "currency");
-  if (problem) {
-    console.error(`SSLCommerz validation rejected for ${payment.tranId}: ${problem} mismatch`);
-    return res.status(400).json({ message: "Transaction could not be verified" });
-  }
-
-  const details = {
-    valId,
-    bankTranId: result.bank_tran_id ?? null,
-    cardType: result.card_type ?? null,
-    riskLevel: Number(result.risk_level),
-    updatedAt: new Date(),
-  };
-
-  // Anything other than an explicit risk level 0 is held for manual review, never auto-paid
-  if (details.riskLevel !== 0) {
-    await payments().updateOne({ tranId, status: "pending" }, { $set: { ...details, reviewRequired: true } });
-    return res.json({ message: "Held for review" });
-  }
-
-  // Atomic: the booking and the payment both change, or neither does
-  const session = client.startSession();
-  try {
-    await session.withTransaction(async () => {
-      const now = new Date();
-      const booking = await bookings().updateOne(
-        { _id: payment.bookingId, customerId: payment.customerId, paymentStatus: "unpaid" },
-        { $set: { paymentStatus: "paid", paidAt: now, updatedAt: now } },
-        { session }
-      );
-      if (!booking.matchedCount) throw new Rollback();
-
-      const paid = await payments().updateOne(
-        { tranId, status: { $in: ["pending", "failed", "cancelled"] } },
-        { $set: { ...details, status: "paid", reviewRequired: false, failureReason: null, paidAt: now } },
-        { session }
-      );
-      if (!paid.matchedCount) throw new Rollback();
-    });
-  } catch (error) {
-    if (!(error instanceof Rollback)) throw error;
-    // Already paid (a repeated IPN) or the booking was settled another way: nothing was changed
-    console.error(`SSLCommerz payment ${payment.tranId} not applied: booking already paid or payment already processed`);
-    return res.json({ message: "Already processed" });
-  } finally {
-    await session.endSession();
-  }
-
-  res.json({ message: "Payment recorded" });
-};
-
-// Browser redirects from SSLCommerz. They only send the customer back to the site; they never change data.
-export const redirectToFrontend = (outcome) => (req, res) => {
-  res.redirect(303, `${process.env.FRONTEND_URL}/dashboard/my-bookings?payment=${outcome}`);
 };

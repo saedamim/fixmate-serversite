@@ -27,6 +27,8 @@ app.use(
 
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
+// Stripe signs the exact bytes it sends, so the webhook needs the raw body (this must stay before express.json)
+app.use("/api/payments/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 app.use("/api/upload", uploadRoutes);
 app.use("/api/services", serviceRoutes);
@@ -65,12 +67,25 @@ const startServer = async () => {
       }
     );
 
-    // Payment lookups, plus only one pending payment per booking at a time
+    // Payments: drop the indexes of the removed SSLCommerz integration (the collection holds no records), then
+    // allow one pending and one paid payment per booking and a unique Stripe session
     const payments = db.collection("payments");
-    await payments.createIndex({ tranId: 1 }, { unique: true, name: "unique_tran_id" });
+    for (const name of ["unique_tran_id", "one_pending_payment_per_booking"]) {
+      await payments.dropIndex(name).catch((error) => {
+        if (!["IndexNotFound", "NamespaceNotFound"].includes(error.codeName)) throw error;
+      });
+    }
+    await payments.createIndex(
+      { stripeSessionId: 1 },
+      { unique: true, partialFilterExpression: { stripeSessionId: { $type: "string" } }, name: "unique_stripe_session" }
+    );
     await payments.createIndex(
       { bookingId: 1 },
-      { unique: true, partialFilterExpression: { status: "pending" }, name: "one_pending_payment_per_booking" }
+      { unique: true, partialFilterExpression: { paymentStatus: "pending" }, name: "one_pending_checkout_per_booking" }
+    );
+    await payments.createIndex(
+      { bookingId: 1 },
+      { unique: true, partialFilterExpression: { paymentStatus: "paid" }, name: "one_paid_payment_per_booking" }
     );
     await payments.createIndex({ customerId: 1, createdAt: -1 }, { name: "payments_by_customer" });
 
