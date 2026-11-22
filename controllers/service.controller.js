@@ -10,7 +10,7 @@ const SORTS = {
 };
 
 // Match the frontend `Service` type: expose `_id` as `id`.
-const toService = ({ _id, ...rest }) => ({ id: _id.toString(), ...rest });
+export const toService = ({ _id, ...rest }) => ({ id: _id.toString(), ...rest });
 
 const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

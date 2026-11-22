@@ -1,6 +1,7 @@
 import uploadRoutes from "./routes/upload.routes.js";
 import serviceRoutes from "./routes/service.routes.js";
 import bookingRoutes from "./routes/booking.routes.js";
+import adminRoutes from "./routes/admin.routes.js";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -27,6 +28,7 @@ app.use(express.json());
 app.use("/api/upload", uploadRoutes);
 app.use("/api/services", serviceRoutes);
 app.use("/api/bookings", bookingRoutes);
+app.use("/api/admin", adminRoutes);
 app.get(
   "/api/test/customer",
   verifyToken,

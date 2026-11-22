@@ -171,3 +171,18 @@ test("status moves follow the allowed order and completing needs a positive fina
   const list = await call("GET", "/api/bookings/technician", techToken);
   assert.deepEqual(list.body.counts, { total: 1, requested: 0, accepted: 0, in_progress: 0, completed: 1, cancelled: 0, rejected: 0 });
 });
+
+test("customer list includes counts for this customer's bookings only, whatever the filter", async () => {
+  const all = await call("GET", "/api/bookings/my", token);
+  assert.equal(all.status, 200);
+  assert.deepEqual(all.body.counts, { total: 1, requested: 0, accepted: 0, in_progress: 0, completed: 1, cancelled: 0, rejected: 0 });
+  assert.equal(all.body.bookings[0].finalAmount, 55);
+  assert.equal(all.body.bookings[0].paymentStatus, "unpaid");
+
+  const filtered = await call("GET", "/api/bookings/my?status=cancelled", token);
+  assert.equal(filtered.body.total, 0);
+  assert.equal(filtered.body.counts.completed, 1); // counts ignore the filter
+
+  // A different customer (here: the technician account) never sees these bookings in its own counts
+  assert.equal((await call("GET", "/api/bookings/my", techToken)).status, 403);
+});
