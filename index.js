@@ -11,6 +11,7 @@ import dotenv from "dotenv";
 import { toNodeHandler } from "better-auth/node";
 import connectDB, { db } from "./config/db.js";
 import { auth } from "./config/auth.js";
+import { FRONTEND_URL } from "./config/frontend.js";
 import verifyToken from "./middlewares/verifyToken.js";
 import verifyRole from "./middlewares/verifyRole.js";
 
@@ -20,7 +21,7 @@ const app = express();
 
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL,
+    origin: FRONTEND_URL,
     credentials: true,
   })
 );

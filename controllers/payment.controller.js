@@ -1,6 +1,7 @@
 import { ObjectId } from "mongodb";
 import { client, db } from "../config/db.js";
 import { getStripe, isConfigured } from "../config/stripe.js";
+import { FRONTEND_URL } from "../config/frontend.js";
 import { text } from "./booking.controller.js";
 import { paging } from "./admin.controller.js";
 
@@ -109,8 +110,8 @@ export const createCheckoutSession = async (req, res) => {
       ],
       metadata: { bookingId: booking._id.toString(), customerEmail: payment.customerEmail },
       expires_at: Math.floor(payment.expiresAt.getTime() / 1000),
-      success_url: `${process.env.FRONTEND_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL}/payment/cancel`,
+      success_url: `${FRONTEND_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/payment/cancel`,
     });
 
     await payments().updateOne(
