@@ -41,6 +41,10 @@ user: {
     google: {
       clientId: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      // Google returns to the FRONTEND domain, which forwards /api/auth/* to this API (next.config.ts rewrite), so the
+      // OAuth state cookie is set and read on the same domain. FRONTEND_URL has no trailing slash (config/frontend.js).
+      // Register exactly this address under "Authorized redirect URIs" in Google Cloud Console.
+      redirectURI: `${FRONTEND_URL}/api/auth/callback/google`,
     },
   },
   databaseHooks: {
