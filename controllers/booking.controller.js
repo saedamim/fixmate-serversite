@@ -200,7 +200,7 @@ export const getTechnicianBookings = async (req, res) => {
   const filter = { technicianEmail: email };
   if (STATUSES.includes(req.query.status)) filter.status = req.query.status;
 
-  const [items, total] = await Promise.all([
+  const [items, total, grouped] = await Promise.all([
     bookings()
       .find(filter)
       .sort({ createdAt: -1, _id: -1 })
@@ -208,11 +208,22 @@ export const getTechnicianBookings = async (req, res) => {
       .limit(limit)
       .toArray(),
     bookings().countDocuments(filter),
+    // Counts cover all of this technician's bookings, whatever the status filter or page
+    bookings()
+      .aggregate([{ $match: { technicianEmail: email } }, { $group: { _id: "$status", count: { $sum: 1 } } }])
+      .toArray(),
   ]);
+
+  const counts = { total: 0, ...Object.fromEntries(STATUSES.map((s) => [s, 0])) };
+  for (const { _id, count } of grouped) {
+    counts.total += count;
+    if (STATUSES.includes(_id)) counts[_id] = count;
+  }
 
   res.json({
     bookings: items.map(toBooking),
     total,
+    counts,
     page,
     limit,
     totalPages: Math.ceil(total / limit),
