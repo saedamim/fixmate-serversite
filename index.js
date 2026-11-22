@@ -1,3 +1,5 @@
+// Load .env before any other module: verifyToken.js reads BETTER_AUTH_URL when it is imported
+import "dotenv/config";
 import uploadRoutes from "./routes/upload.routes.js";
 import serviceRoutes from "./routes/service.routes.js";
 import bookingRoutes from "./routes/booking.routes.js";
