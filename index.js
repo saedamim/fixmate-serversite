@@ -19,6 +19,9 @@ dotenv.config();
 
 const app = express();
 
+// Behind Vercel's proxy: lets req.ip be the real client address (used by the upload rate limit)
+app.set("trust proxy", 1);
+
 app.use(
   cors({
     origin: FRONTEND_URL,
@@ -50,6 +53,14 @@ app.get(
 );
 app.get("/", (req, res) => {
   res.send("FixMate API is running!");
+});
+
+// Unknown routes and unexpected errors answer with JSON (never an HTML page or a stack trace)
+app.use((req, res) => res.status(404).json({ success: false, message: "Route not found" }));
+app.use((error, req, res, next) => {
+  console.error("Unhandled error:", error);
+  if (res.headersSent) return next(error);
+  res.status(error.status || 500).json({ success: false, message: "Something went wrong on the server" });
 });
 
 const PORT = process.env.PORT || 8000;
