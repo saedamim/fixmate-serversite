@@ -7,6 +7,7 @@ import {
   getAllServices,
   updateServiceStatus,
   getAllBookings,
+  getTransactions,
 } from "../controllers/admin.controller.js";
 
 const router = express.Router();
@@ -19,5 +20,6 @@ router.get("/users", getUsers);
 router.get("/services", getAllServices);
 router.patch("/services/:id/status", updateServiceStatus);
 router.get("/bookings", getAllBookings);
+router.get("/transactions", getTransactions);
 
 export default router;

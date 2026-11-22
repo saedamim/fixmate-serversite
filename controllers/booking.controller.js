@@ -36,11 +36,9 @@ export const countByStatus = async (match) => {
   return counts;
 };
 
-// Only plain strings are accepted (blocks objects like { $gt: "" } from the body).
-const text = (value) => (typeof value === "string" ? value.trim() : "");
 
-// True only for real calendar dates. Date.parse() is not enough because it rolls
-// impossible dates forward (2026-02-31 becomes March 3), so the parts are compared.
+export const text = (value) => (typeof value === "string" ? value.trim() : "");
+
 const isRealDate = (value) => {
   const [year, month, day] = value.split("-").map(Number);
   const date = new Date(Date.UTC(year, month - 1, day));

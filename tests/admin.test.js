@@ -122,8 +122,9 @@ test("stats match the database", async () => {
   assert.equal(body.bookings.total, await count("bookings"));
   assert.equal(body.bookings.completed, await count("bookings", { status: "completed" }));
 
-  const completed = await db.collection("bookings").find({ status: "completed" }).toArray();
-  assert.equal(body.revenue, completed.reduce((total, b) => total + (b.finalAmount ?? 0), 0));
+  // Revenue is the total of verified "paid" payments only (not completed bookings)
+  const paid = await db.collection("payments").find({ status: "paid" }).toArray();
+  assert.equal(body.revenue, paid.reduce((total, p) => total + p.amount, 0));
 });
 
 test("users list is paginated, filterable and never exposes secrets", async () => {

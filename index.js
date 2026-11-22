@@ -4,6 +4,7 @@ import uploadRoutes from "./routes/upload.routes.js";
 import serviceRoutes from "./routes/service.routes.js";
 import bookingRoutes from "./routes/booking.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
+import paymentRoutes from "./routes/payment.routes.js";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -31,6 +32,7 @@ app.use("/api/upload", uploadRoutes);
 app.use("/api/services", serviceRoutes);
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/payments", paymentRoutes);
 app.get(
   "/api/test/customer",
   verifyToken,
@@ -62,6 +64,15 @@ const startServer = async () => {
         name: "one_active_booking_per_customer_service",
       }
     );
+
+    // Payment lookups, plus only one pending payment per booking at a time
+    const payments = db.collection("payments");
+    await payments.createIndex({ tranId: 1 }, { unique: true, name: "unique_tran_id" });
+    await payments.createIndex(
+      { bookingId: 1 },
+      { unique: true, partialFilterExpression: { status: "pending" }, name: "one_pending_payment_per_booking" }
+    );
+    await payments.createIndex({ customerId: 1, createdAt: -1 }, { name: "payments_by_customer" });
 
     app.listen(PORT, () => {
       console.log(`FixMate server running on port ${PORT}`);

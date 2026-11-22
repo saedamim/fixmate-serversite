@@ -6,10 +6,11 @@ import { toService } from "./service.controller.js";
 const ROLES = ["customer", "technician", "admin"];
 const SERVICE_STATUSES = ["pending", "approved", "rejected"];
 const BOOKING_STATUSES = ["requested", "accepted", "in_progress", "completed", "cancelled", "rejected"];
+const PAYMENT_STATUSES = ["pending", "paid", "failed", "cancelled"];
 const ID_PATTERN = /^[a-f\d]{24}$/i;
 
 // page / limit from the query string (limit is capped at 50)
-const paging = (query) => ({
+export const paging = (query) => ({
   page: Math.max(parseInt(query.page) || 1, 1),
   limit: Math.min(Math.max(parseInt(query.limit) || 10, 1), 50),
 });
@@ -33,10 +34,10 @@ export const getStats = async (req, res) => {
     countBy("user", "role", ROLES),
     countBy("services", "status", SERVICE_STATUSES),
     countByStatus({}),
-    // Total of the final amounts technicians entered for completed work
+    // Revenue is only money that SSLCommerz validated (payments marked "paid"), never completed-but-unpaid work
     db
-      .collection("bookings")
-      .aggregate([{ $match: { status: "completed" } }, { $group: { _id: null, total: { $sum: "$finalAmount" } } }])
+      .collection("payments")
+      .aggregate([{ $match: { status: "paid" } }, { $group: { _id: null, total: { $sum: "$amount" } } }])
       .toArray(),
   ]);
 
@@ -135,6 +136,31 @@ export const getAllBookings = async (req, res) => {
 
   res.json({
     bookings: items.map(toBooking),
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+  });
+};
+
+// Real payment records (not bookings). Safe fields only: no session key, validation id or provider data.
+export const getTransactions = async (req, res) => {
+  const { page, limit } = paging(req.query);
+  const filter = PAYMENT_STATUSES.includes(req.query.status) ? { status: req.query.status } : {};
+
+  const payments = db.collection("payments");
+  const [items, total] = await Promise.all([
+    payments
+      .find(filter, { projection: { sessionKey: 0, valId: 0 } })
+      .sort({ createdAt: -1, _id: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+    payments.countDocuments(filter),
+  ]);
+
+  res.json({
+    transactions: items.map(({ _id, bookingId, ...payment }) => ({ id: _id.toString(), bookingId: bookingId.toString(), ...payment })),
     total,
     page,
     limit,
