@@ -61,7 +61,18 @@ export const getServiceById = async (req, res) => {
     return res.status(404).json({ message: "Service not found" });
   }
 
-  res.json(toService(service));
+  // Technician profile details come from the users collection (matched by the service's technicianEmail)
+  const email = String(service.technicianEmail ?? "").trim().toLowerCase();
+  const technician = email
+    ? await db.collection("user").findOne({ email }, { projection: { image: 1, area: 1, bio: 1 } })
+    : null;
+
+  res.json({
+    ...toService(service),
+    technicianImage: technician?.image ?? null,
+    technicianArea: technician?.area ?? null,
+    technicianBio: technician?.bio ?? null,
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -206,4 +217,26 @@ export const deleteService = async (req, res) => {
   if (!deletedCount) return res.status(404).json({ message: "Service not found" });
 
   res.json({ message: "Service deleted" });
+};
+
+// PATCH /api/services/:id/availability  { available: boolean }. Owner only. Unlike a full edit it keeps the
+// approval status, because only the on/off switch changes.
+export const setAvailability = async (req, res) => {
+  const { id } = req.params;
+  const email = technicianEmail(req);
+  if (!email || !ID_PATTERN.test(id)) return res.status(404).json({ message: "Service not found" });
+
+  const { available } = req.body ?? {};
+  if (typeof available !== "boolean") return res.status(400).json({ message: "Available must be true or false" });
+
+  const updated = await db
+    .collection("services")
+    .findOneAndUpdate(
+      { _id: new ObjectId(id), technicianEmail: email },
+      { $set: { available, updatedAt: new Date().toISOString() } },
+      { returnDocument: "after" }
+    );
+  if (!updated) return res.status(404).json({ message: "Service not found" });
+
+  res.json({ service: toService(updated) });
 };

@@ -8,6 +8,7 @@ import {
   createService,
   updateService,
   deleteService,
+  setAvailability,
 } from "../controllers/service.controller.js";
 
 const router = express.Router();
@@ -21,6 +22,7 @@ router.get("/mine", technicianOnly, getMyServices);
 router.post("/", technicianOnly, createService);
 router.put("/:id", technicianOnly, updateService);
 router.delete("/:id", technicianOnly, deleteService);
+router.patch("/:id/availability", technicianOnly, setAvailability);
 
 router.get("/:id", getServiceById);
 
