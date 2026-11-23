@@ -116,6 +116,7 @@ FixMate Backend is a RESTful API built with Node.js and Express.js. It manages a
 | POST | `/api/services` | Create a service |
 | PATCH | `/api/services/:id` | Update a service |
 | DELETE | `/api/services/:id` | Delete a service |
+| PATCH | `/api/services/:id/availability` | Turn a service on or off (owner technician, keeps approval) |
 | GET | `/api/bookings/my` | Get customer bookings |
 | POST | `/api/bookings` | Create a booking |
 | PATCH | `/api/bookings/:id/cancel` | Cancel a booking |
@@ -126,6 +127,8 @@ FixMate Backend is a RESTful API built with Node.js and Express.js. It manages a
 | PATCH | `/api/admin/services/:id/approval` | Approve or reject a service |
 | GET | `/api/admin/bookings` | Get all bookings |
 | GET | `/api/admin/payments` | Get payment transactions |
+| GET | `/api/admin/revenue-by-day?days=30` | Paid revenue per day (admin) |
+| GET | `/api/payments/earnings-by-day?days=30` | Technician paid earnings per day |
 | POST | `/api/payments/create-checkout-session` | Create Stripe Checkout Session |
 
 ## Database Collections
