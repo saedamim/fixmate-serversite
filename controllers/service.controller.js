@@ -12,6 +12,9 @@ const SORTS = {
 // Match the frontend `Service` type: expose `_id` as `id`.
 export const toService = ({ _id, ...rest }) => ({ id: _id.toString(), ...rest });
 
+// The same for the public pages: the technician's email stays private (the owner and admin endpoints still use toService)
+const toPublicService = ({ technicianEmail, ...service }) => toService(service);
+
 const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export const getServices = async (req, res) => {
@@ -41,7 +44,7 @@ export const getServices = async (req, res) => {
   ]);
 
   res.json({
-    services: items.map(toService),
+    services: items.map(toPublicService),
     total,
     page,
     limit,
@@ -68,7 +71,7 @@ export const getServiceById = async (req, res) => {
     : null;
 
   res.json({
-    ...toService(service),
+    ...toPublicService(service),
     technicianImage: technician?.image ?? null,
     technicianArea: technician?.area ?? null,
     technicianBio: technician?.bio ?? null,
