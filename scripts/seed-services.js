@@ -1,4 +1,5 @@
 import connectDB, { client, db } from "../config/db.js";
+import { serviceImages } from "./lib/service-images.js";
 
 const base = { imageUrl: null, status: "approved", available: true };
 
@@ -27,7 +28,7 @@ try {
     services.map((service) => ({
       updateOne: {
         filter: { title: service.title },
-        update: { $setOnInsert: { ...base, ...service } },
+        update: { $setOnInsert: { ...base, ...service, imageUrl: serviceImages[service.title] ?? null } },
         upsert: true,
       },
     }))
