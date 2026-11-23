@@ -7,6 +7,7 @@ import {
   getMyPayments,
   handleWebhook,
   getTechnicianEarnings,
+  getTechnicianEarningsByDay,
 } from "../controllers/payment.controller.js";
 
 const router = express.Router();
@@ -16,6 +17,7 @@ router.post("/webhook", handleWebhook);
 
 // Technician route (declared before the customer-only guard below)
 router.get("/earnings", verifyToken, verifyRole("technician"), getTechnicianEarnings);
+router.get("/earnings-by-day", verifyToken, verifyRole("technician"), getTechnicianEarningsByDay);
 
 // Customer routes
 router.use(verifyToken, verifyRole("customer"));

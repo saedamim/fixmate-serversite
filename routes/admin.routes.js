@@ -9,6 +9,7 @@ import {
   updateServiceStatus,
   getAllBookings,
   getTransactions,
+  getRevenueByDay,
 } from "../controllers/admin.controller.js";
 
 const router = express.Router();
@@ -23,5 +24,6 @@ router.get("/services", getAllServices);
 router.patch("/services/:id/status", updateServiceStatus);
 router.get("/bookings", getAllBookings);
 router.get("/transactions", getTransactions);
+router.get("/revenue-by-day", getRevenueByDay);
 
 export default router;

@@ -189,6 +189,12 @@ export const getAllBookings = async (req, res) => {
   });
 };
 
+// GET /api/admin/revenue-by-day?days=30 => [{ date, revenue }] (paid payments only)
+export const getRevenueByDay = async (req, res) => {
+  const { revenueByDay } = await import("./payment.controller.js"); // lazy: payment.controller imports this file
+  res.json(await revenueByDay({}, req.query.days));
+};
+
 // Real payment records (not bookings). Safe fields only: no session key, validation id or provider data.
 export const getTransactions = async (req, res) => {
   const { page, limit } = paging(req.query);

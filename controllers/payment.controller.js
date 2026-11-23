@@ -281,6 +281,36 @@ export const getMyPayments = async (req, res) => {
   res.json({ payments: items.map(toPayment), total, page, limit, totalPages: Math.ceil(total / limit) });
 };
 
+// Paid amounts per day for the last `days` days (default 30, max 365), every day present, oldest first.
+export const revenueByDay = async (match, daysParam) => {
+  const days = Math.min(Math.max(parseInt(daysParam) || 30, 1), 365);
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  start.setUTCDate(start.getUTCDate() - (days - 1));
+
+  const rows = await payments()
+    .aggregate([
+      { $match: { ...match, paymentStatus: "paid", paidAt: { $gte: start } } },
+      { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$paidAt", timezone: "UTC" } }, revenue: { $sum: "$amount" } } },
+    ])
+    .toArray();
+  const byDate = new Map(rows.map((r) => [r._id, r.revenue]));
+
+  return Array.from({ length: days }, (_, i) => {
+    const date = new Date(start);
+    date.setUTCDate(start.getUTCDate() + i);
+    const key = date.toISOString().slice(0, 10);
+    return { date: key, revenue: byDate.get(key) ?? 0 };
+  });
+};
+
+// GET /api/payments/earnings-by-day?days=30 (technician): only this technician's own paid bookings
+export const getTechnicianEarningsByDay = async (req, res) => {
+  const email = text(req.user.email).toLowerCase();
+  if (!email) return res.status(403).json({ message: "Access forbidden" });
+  res.json(await revenueByDay({ technicianEmail: email }, req.query.days));
+};
+
 // GET /api/payments/earnings (technician). Earnings are money Stripe confirmed: payments marked "paid" for this
 // technician's own bookings. Completed-but-unpaid work is never counted.
 export const getTechnicianEarnings = async (req, res) => {
