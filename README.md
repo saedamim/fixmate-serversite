@@ -1,87 +1,150 @@
-# FixMate Server
+# FixMate — Backend API
 
-Express API for FixMate, a home and device repair marketplace. Customers book services, technicians manage their own
-services and bookings, admins approve services, and customers pay for completed work with Stripe Checkout (test mode).
+FixMate Backend is a RESTful API built with Node.js and Express.js. It manages authentication, users, repair services, bookings, role-based authorization, image uploads, and Stripe payments.
 
-Stack: Node.js (ES modules), Express 5, MongoDB, Better Auth (email/password + Google, JWT plugin), Stripe, ImgBB.
+**Live API:** https://fixmate-client-vs29.vercel.app
 
-## Run locally
+**Frontend:** https://fixmate-client-chi-ten.vercel.app
 
-```
-npm install
-cp .env.example .env     # then fill in the values (see below), or create .env by hand
-npm run dev              # http://localhost:8000
-npm run seed             # 12 approved demo services (safe to repeat, never duplicates)
-```
+## Features
 
-## Environment variables (names only; never commit values)
+### 1. Authentication and Authorization
+- Better Auth integration.
+- Email and password authentication.
+- Google OAuth authentication.
+- JWT-based authentication for protected API routes.
+- Role-based authorization for Customer, Technician, and Admin.
+- Secure token verification.
+- Ownership-based access control.
 
-| Name | Purpose |
-|---|---|
-| `MONGODB_URI` | MongoDB connection string (database `fixmate`). |
-| `BETTER_AUTH_URL` | This API's own public https address, no trailing slash. Used by Better Auth and to verify JWTs. |
-| `BETTER_AUTH_SECRET` | Long random secret for Better Auth. |
-| `FRONTEND_URL` | The deployed frontend's https origin, no trailing slash. CORS, trusted origin, Google redirect and Stripe return URLs. |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google sign-in. Authorized redirect URI: `<FRONTEND_URL>/api/auth/callback/google`. |
-| `IMGBB_API_KEY` | Image uploads. |
-| `STRIPE_SECRET_KEY` | Stripe test key (`sk_test_...`). Live keys are refused. |
-| `STRIPE_WEBHOOK_SECRET` | Signing secret of the Stripe webhook that points at `<BETTER_AUTH_URL>/api/payments/webhook`. |
-| `PORT` | Local port only (default 8000). Not needed on Vercel. |
+### 2. User Management
+- Manage registered users.
+- Support Customer, Technician, and Admin roles.
+- Update user profile information.
+- Manage user roles through admin access.
 
-## Authentication and roles
+### 3. Service Management
+- Create repair service listings.
+- Update and delete owned services.
+- Upload service images through ImgBB.
+- Admin service approval system.
+- Manage service availability.
+- Public service listing API.
+- Server-side search, filtering, sorting, and pagination.
+- Featured services.
 
-Better Auth runs on this server (`/api/auth/*`). New users get the role `customer`; the `role` field cannot be set
-from the request. Protected routes need `Authorization: Bearer <JWT>`. The token is verified against this server's JWKS
-(`verifyToken`), then `verifyRole(...)` checks the role. Missing/invalid token: `401`. Wrong role: `403`.
+### 4. Booking Management
+- Customers can create repair requests.
+- Prevent duplicate active bookings for the same service.
+- Customers can view their own bookings.
+- Customers can cancel eligible requested bookings.
+- Technicians can view their assigned requests.
+- Technicians can accept or reject requests.
+- Technicians can update repair progress.
+- Technicians can complete repair jobs.
+- Booking ownership and status transition validation.
 
-## API
+### 5. Payment Management
+- Stripe Test Mode integration.
+- Stripe Checkout Session creation.
+- Payment allowed only for completed and unpaid bookings.
+- Server-side payment amount validation.
+- Stripe payment verification.
+- Stripe webhook handling.
+- Duplicate payment protection through idempotent processing.
+- Payment transaction history.
 
-Public
-- `GET /` health check
-- `GET /api/services` approved and available services. Query: `search`, `category`, `mode`, `sort`
-  (`newest`, `price-low-to-high`, `price-high-to-low`), `page`, `limit`
-- `GET /api/services/:id`
-- `POST /api/upload/image` multipart field `image` (PNG, JPEG, WebP, GIF, up to 2 MB) uploaded to ImgBB
-- `POST /api/payments/webhook` Stripe only, signature checked
+### 6. Admin Management
+- View platform statistics.
+- Manage users and roles.
+- Approve technician services.
+- View all bookings.
+- View payment transactions and revenue.
 
-Technician
-- `GET /api/services/mine`, `POST /api/services`, `PUT /api/services/:id`, `DELETE /api/services/:id`
-  (own services only; new or edited services wait for admin approval)
-- `GET /api/bookings/technician`, `PATCH /api/bookings/technician/:id/status`
+## How It Works
 
-Customer
-- `POST /api/bookings`, `GET /api/bookings/my`, `GET /api/bookings/:id`, `PATCH /api/bookings/:id/cancel`
-- `POST /api/payments/create-checkout-session`, `GET /api/payments/verify`, `GET /api/payments/my`
+### Authentication Flow
+1. A user signs up or signs in through the frontend.
+2. Better Auth handles authentication.
+3. The backend manages authentication sessions and JWT verification.
+4. Protected API requests are validated through authentication middleware.
+5. Role-based middleware restricts access to authorized resources.
 
-Admin
-- `GET /api/admin/stats|users|services|bookings|transactions`, `PATCH /api/admin/services/:id/status`
+### Service Workflow
+1. A technician creates a repair service.
+2. The service is submitted for admin approval.
+3. The admin reviews the listing.
+4. Approved services become publicly available.
+5. Customers can search, filter, sort, and view service details.
 
-### Booking rules
-- One active booking per customer and service (unique partial index).
-- Customer can cancel only a `requested` booking.
-- Technician moves a booking only along: `requested` to `accepted` or `rejected`, `accepted` to `in_progress`,
-  `in_progress` to `completed` (with `finalAmount`). Any other move returns `409`.
-- Price, service title and technician always come from the database, never the request.
+### Booking Workflow
+1. A customer selects a repair service.
+2. The customer submits a booking request with issue details.
+3. The technician receives the request.
+4. The technician accepts or rejects the request.
+5. Accepted requests can move to in-progress.
+6. After completing the repair, the technician marks the booking as completed.
+7. The customer can then make payment.
 
-### Payments
-- Only a `completed` and `unpaid` booking can be paid. The amount is read from the booking's `finalAmount` on the server.
-- One open checkout per booking. A paid booking cannot be paid twice (a duplicate charge is flagged for refund).
-- A payment becomes `paid` only after the Stripe session is confirmed (verify endpoint or signed webhook); repeating
-  either is safe.
+### Payment Workflow
+1. The customer opens a completed, unpaid booking.
+2. The frontend requests a Stripe Checkout Session.
+3. The backend verifies booking ownership and payment eligibility.
+4. The backend calculates the payment amount using the booking's final amount.
+5. The customer completes payment through Stripe Checkout.
+6. Stripe sends payment events to the backend webhook.
+7. The backend verifies and records the payment securely.
 
-## Data
+## Technologies Used
 
-Application collections: `services`, `bookings`, `payments`, plus Better Auth's `user` collection.
-Better Auth also creates `session`, `account`, `verification` and `jwks` by itself.
+- Node.js
+- Express.js
+- MongoDB
+- Better Auth
+- JWT
+- Stripe
+- ImgBB
+- JOSE
 
-## Scripts
-- `npm run seed` demo services.
-- `node scripts/assign-technicians.js` assigns the demo services to real technician accounts.
-- `node scripts/promote-admin.js <email>` dry run that reports whether a user could be made admin.
+## API Overview
 
-## Tests
-`npm test`. Several test files call a running server and use real data, so point `BETTER_AUTH_URL` / `API_URL` at a
-local server and a test database first.
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/services` | Get services with search and filters |
+| GET | `/api/services/featured` | Get featured services |
+| GET | `/api/services/:id` | Get service details |
+| POST | `/api/services` | Create a service |
+| PATCH | `/api/services/:id` | Update a service |
+| DELETE | `/api/services/:id` | Delete a service |
+| GET | `/api/bookings/my` | Get customer bookings |
+| POST | `/api/bookings` | Create a booking |
+| PATCH | `/api/bookings/:id/cancel` | Cancel a booking |
+| GET | `/api/bookings/technician` | Get technician bookings |
+| PATCH | `/api/bookings/:id/status` | Update booking status |
+| GET | `/api/admin/users` | Get users |
+| PATCH | `/api/admin/users/:id/role` | Update user role |
+| PATCH | `/api/admin/services/:id/approval` | Approve or reject a service |
+| GET | `/api/admin/bookings` | Get all bookings |
+| GET | `/api/admin/payments` | Get payment transactions |
+| POST | `/api/payments/create-checkout-session` | Create Stripe Checkout Session |
 
-## Deploy (Vercel)
-Set every variable above in the backend project, redeploy, add the Stripe webhook URL, and add the Google redirect URI.
+## Database Collections
+
+The application uses MongoDB for data storage.
+
+- **users** — User account and profile information managed through Better Auth.
+- **services** — Technician service listings.
+- **bookings** — Customer repair requests and booking details.
+- **payments** — Payment transaction records.
+
+Better Auth may also create its own authentication-related collections, such as sessions, accounts, and verification records.
+
+## Deployment
+
+The backend is deployed on Vercel:
+
+https://fixmate-client-vs29.vercel.app
+
+## Frontend Repository
+
+https://github.com/saedamim/fixmate-client
