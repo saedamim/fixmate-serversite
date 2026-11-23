@@ -136,7 +136,7 @@ export const createBooking = async (req, res) => {
   } catch (error) {
     // The unique partial index allows only one active booking per customer and service
     if (error.code === 11000) {
-      return res.status(409).json({ message: "You already have an active booking for this service" });
+      return res.status(409).json({ message: "You already have an active request for this service" });
     }
     throw error;
   }
