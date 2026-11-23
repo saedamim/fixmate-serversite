@@ -9,7 +9,7 @@ import Stripe from "stripe";
 import { ObjectId } from "mongodb";
 import connectDB, { client, db } from "../config/db.js";
 import { useStripe } from "../config/stripe.js";
-import { createCheckoutSession, verifyPayment, handleWebhook, getMyPayments } from "../controllers/payment.controller.js";
+import { createCheckoutSession, verifyPayment, handleWebhook, getMyPayments, getTechnicianEarnings } from "../controllers/payment.controller.js";
 import { getTransactions, getStats } from "../controllers/admin.controller.js";
 
 dotenv.config({ quiet: true });
@@ -389,6 +389,24 @@ test("history: a customer sees only their own payments", async () => {
   assert.ok(other.body.payments.every((p) => p.bookingId === theirs.toString()));
 });
 
+test("history: bookingIds returns only those bookings' payments, only for the signed-in customer", async () => {
+  const mine = await newBooking();
+  const theirs = await newBooking({ customerId: OTHER.id });
+  for (const [id, user] of [[mine, CUSTOMER], [theirs, OTHER]]) {
+    const r = await checkout(id, user);
+    markPaidAtStripe(r.body.sessionId);
+    assert.equal((await verify(r.body.sessionId, user)).status, 200);
+  }
+  const ask = (bookingIds, user = CUSTOMER) => run(getMyPayments, { user, query: { bookingIds, status: "paid" } });
+
+  const own = await ask(mine.toString());
+  assert.deepEqual(own.body.payments.map((p) => p.bookingId), [mine.toString()]);
+  assert.ok(own.body.payments[0].transactionId);
+  assert.equal((await ask(theirs.toString())).body.payments.length, 0); // another customer's booking id finds nothing
+  assert.equal((await ask(`${mine},${new ObjectId()}`)).body.total, 1);
+  for (const bad of ["x", `${mine},nope`, Array(51).fill(mine).join(",")]) assert.equal((await ask(bad)).status, 400, bad);
+});
+
 test("admin transactions: real payment records, filterable, without checkout links", async () => {
   const id = await newBooking();
   const { body } = await checkout(id);
@@ -428,6 +446,36 @@ test("revenue: counts only genuinely paid payments, never unpaid completed booki
 
 // ---- HTTP (needs the running server) ----
 
+test("technician earnings: only this technician's genuinely paid payments are counted", async () => {
+  const tech = `fm-test-earn-${stamp}@example.test`;
+  const other = `fm-test-earn-other-${stamp}@example.test`;
+  const paidA = await newBooking({ technicianEmail: tech, finalAmount: 40 });
+  const paidB = await newBooking({ technicianEmail: tech, finalAmount: 10.5 });
+  const unpaid = await newBooking({ technicianEmail: tech, finalAmount: 999 }); // completed but never paid
+  const otherTech = await newBooking({ technicianEmail: other, finalAmount: 500 });
+
+  for (const id of [paidA, paidB, otherTech]) {
+    const r = await checkout(id);
+    markPaidAtStripe(r.body.sessionId);
+    assert.equal((await verify(r.body.sessionId)).status, 200);
+  }
+  const open = await checkout(unpaid); // open checkout: pending, not earnings
+  assert.equal(open.status, 201);
+
+  const r = await run(getTechnicianEarnings, { user: { id: "t1", email: tech.toUpperCase() } });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.totalEarnings, 50.5);
+  assert.equal(r.body.paidCount, 2);
+  assert.equal(r.body.recent.length, 2);
+  assert.ok(r.body.recent.every((p) => p.amount === 40 || p.amount === 10.5));
+  assert.equal(r.body.recent[0].checkoutUrl, undefined);
+
+  const none = await run(getTechnicianEarnings, { user: { id: "t2", email: `fm-test-nobody-${stamp}@example.test` } });
+  assert.equal(none.body.totalEarnings, 0);
+  assert.deepEqual(none.body.recent, []);
+  assert.equal((await run(getTechnicianEarnings, { user: { id: "t3" } })).status, 403);
+});
+
 test("HTTP: payment and admin routes enforce authentication; the webhook works with the raw body", async () => {
   const ask = (method, path, token, body) =>
     fetch(`${API_URL}${path}`, {
@@ -450,6 +498,8 @@ test("HTTP: payment and admin routes enforce authentication; the webhook works w
   assert.equal(await ask("GET", "/api/payments/verify?session_id=cs_test_x"), 401);
   assert.equal(await ask("GET", "/api/payments/my"), 401);
   assert.equal(await ask("GET", "/api/payments/my", token), 200);
+  assert.equal(await ask("GET", "/api/payments/earnings"), 401);
+  assert.equal(await ask("GET", "/api/payments/earnings", token), 403); // earnings are for technicians only
 
   // the webhook is public, but an unsigned request is refused (400 once Stripe is configured, 503 before)
   assert.ok([400, 503].includes(await ask("POST", "/api/payments/webhook", null, { type: "checkout.session.completed" })));

@@ -162,6 +162,7 @@ test("status moves follow the allowed order and completing needs a positive fina
   assert.equal((await move("completed")).status, 400); // no finalAmount
   assert.equal((await move("completed", { finalAmount: 0 })).status, 400);
   assert.equal((await move("completed", { finalAmount: "50" })).status, 400);
+  assert.equal((await move("completed", { finalAmount: 100001 })).status, 400); // above the ceiling
 
   const done = await move("completed", { finalAmount: 55 });
   assert.equal(done.status, 200);

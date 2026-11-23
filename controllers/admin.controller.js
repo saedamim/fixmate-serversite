@@ -1,5 +1,5 @@
 import { ObjectId } from "mongodb";
-import { db } from "../config/db.js";
+import { client, db } from "../config/db.js";
 import { toBooking, countByStatus } from "./booking.controller.js";
 import { toService } from "./service.controller.js";
 
@@ -73,6 +73,52 @@ export const getUsers = async (req, res) => {
     limit,
     totalPages: Math.ceil(total / limit),
   });
+};
+
+// Moves one account to a new role, atomically. Returns { status, body } for the response.
+// Demoting an admin first touches EVERY admin account inside the transaction. Two simultaneous demotions therefore write
+// the same documents, MongoDB aborts one of them and re-runs it, and the re-run sees one admin left and is refused.
+// (Counting admins alone is not enough: two transactions could each count 2 and each demote a different admin.)
+export const changeUserRole = async (users, id, role) => {
+  const dbSession = client.startSession();
+  let result;
+  try {
+    await dbSession.withTransaction(async () => {
+      const target = await users.findOne({ _id: new ObjectId(id) }, { projection: { role: 1 }, session: dbSession });
+      if (!target) return void (result = { status: 404, body: { message: "User not found" } });
+
+      if (target.role === "admin" && role !== "admin") {
+        const admins = await users.updateMany({ role: "admin" }, { $set: { updatedAt: new Date() } }, { session: dbSession });
+        if (admins.matchedCount <= 1) {
+          return void (result = { status: 409, body: { message: "The last admin cannot be changed" } });
+        }
+      }
+
+      const updated = await users.findOneAndUpdate(
+        { _id: target._id },
+        { $set: { role, updatedAt: new Date() } },
+        { returnDocument: "after", projection: { name: 1, email: 1, role: 1, emailVerified: 1, createdAt: 1 }, session: dbSession }
+      );
+      const { _id, ...user } = updated;
+      result = { status: 200, body: { message: `Role changed to ${role}`, user: { id: _id.toString(), ...user } } };
+    });
+  } finally {
+    await dbSession.endSession();
+  }
+  return result;
+};
+
+// Change an account's role. Guards: a valid role only, never your own account, and the last admin cannot be removed.
+export const updateUserRole = async (req, res) => {
+  const { id } = req.params;
+  const role = typeof req.body?.role === "string" ? req.body.role.trim() : "";
+
+  if (!ID_PATTERN.test(id)) return res.status(404).json({ message: "User not found" });
+  if (!ROLES.includes(role)) return res.status(400).json({ message: `Role must be one of: ${ROLES.join(", ")}` });
+  if (id === req.user.id) return res.status(400).json({ message: "You cannot change your own role" });
+
+  const { status, body } = await changeUserRole(db.collection("user"), id, role);
+  res.status(status).json(body);
 };
 
 // All services whatever their status (the public API only shows approved ones)

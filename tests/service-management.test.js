@@ -99,6 +99,23 @@ test("a technician can create a service: it starts as pending and belongs to the
   assert.equal(saved.imageUrl, null);
 });
 
+test("duration and service area are optional, trimmed, length-limited and saved only for the owner", async () => {
+  const ok = await call("POST", "/api/services", tokens.techA, valid({ title: "FM TEST Duration", duration: "  1-2 hours ", serviceArea: " Dhaka " }));
+  assert.equal(ok.status, 201);
+  const saved = await inDb(ok.body.service.id);
+  assert.equal(saved.duration, "1-2 hours");
+  assert.equal(saved.serviceArea, "Dhaka");
+
+  assert.equal((await call("POST", "/api/services", tokens.techA, valid({ duration: "x".repeat(51) }))).status, 400);
+  assert.equal((await call("POST", "/api/services", tokens.techA, valid({ serviceArea: "x".repeat(101) }))).status, 400);
+  assert.equal((await call("POST", "/api/services", tokens.techA, valid({ duration: { $gt: "" } }))).status, 201); // not a string: ignored, never stored as an object
+  const objectCase = await db.collection("services").find({ technicianEmail: emails.techA, title: "FM TEST Screen Repair" }).sort({ _id: -1 }).limit(1).next();
+  assert.equal(objectCase.duration, "");
+
+  // remove these extra services so later tests that count this technician's services stay exact
+  await db.collection("services").deleteMany({ _id: { $in: [new ObjectId(ok.body.service.id), objectCase._id] } });
+});
+
 test("invalid service data is rejected (400) and nothing is saved", async () => {
   const before = await db.collection("services").countDocuments({ technicianEmail: emails.techA });
   const bad = [

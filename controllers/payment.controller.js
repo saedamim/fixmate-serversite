@@ -261,6 +261,13 @@ export const getMyPayments = async (req, res) => {
   const filter = { customerId: req.user.id };
   if (PAYMENT_STATUSES.includes(req.query.status)) filter.paymentStatus = req.query.status;
 
+  // Optional: only the payments of these bookings (comma-separated ids, at most 50). Still limited to this customer.
+  if (typeof req.query.bookingIds === "string") {
+    const ids = req.query.bookingIds.split(",").map((id) => id.trim()).filter(Boolean);
+    if (ids.length > 50 || !ids.every((id) => ID_PATTERN.test(id))) return res.status(400).json({ message: "Invalid booking ids" });
+    filter.bookingId = { $in: ids.map((id) => new ObjectId(id)) };
+  }
+
   const [items, total] = await Promise.all([
     payments()
       .find(filter)
@@ -272,4 +279,31 @@ export const getMyPayments = async (req, res) => {
   ]);
 
   res.json({ payments: items.map(toPayment), total, page, limit, totalPages: Math.ceil(total / limit) });
+};
+
+// GET /api/payments/earnings (technician). Earnings are money Stripe confirmed: payments marked "paid" for this
+// technician's own bookings. Completed-but-unpaid work is never counted.
+export const getTechnicianEarnings = async (req, res) => {
+  const email = text(req.user.email).toLowerCase();
+  if (!email) return res.status(403).json({ message: "Access forbidden" });
+
+  const match = { technicianEmail: email, paymentStatus: "paid" };
+  const [totals, recent] = await Promise.all([
+    payments().aggregate([{ $match: match }, { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } }]).toArray(),
+    payments().find(match).sort({ paidAt: -1, _id: -1 }).limit(5).toArray(),
+  ]);
+
+  res.json({
+    totalEarnings: totals[0]?.total ?? 0,
+    paidCount: totals[0]?.count ?? 0,
+    currency: CURRENCY,
+    recent: recent.map((p) => ({
+      id: p._id.toString(),
+      serviceTitle: p.serviceTitle,
+      customerName: p.customerName ?? "",
+      amount: p.amount,
+      transactionId: p.transactionId ?? null,
+      paidAt: p.paidAt ?? null,
+    })),
+  });
 };

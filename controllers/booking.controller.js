@@ -6,6 +6,8 @@ const bookings = () => db.collection("bookings");
 const TIME_SLOTS = ["09:00-12:00", "12:00-15:00", "15:00-18:00"];
 const STATUSES = ["requested", "accepted", "in_progress", "completed", "cancelled", "rejected"];
 const ID_PATTERN = /^[a-f\d]{24}$/i;
+// Same ceiling as a service price; keeps the amount within what Stripe Checkout accepts
+const MAX_FINAL_AMOUNT = 100000;
 
 // Technician status updates: new status -> the only status it may move from.
 const TRANSITIONS = {
@@ -251,8 +253,8 @@ export const updateBookingStatus = async (req, res) => {
 
   if (status === "completed") {
     const { finalAmount } = body;
-    if (typeof finalAmount !== "number" || !Number.isFinite(finalAmount) || finalAmount <= 0) {
-      return res.status(400).json({ message: "finalAmount must be a positive number" });
+    if (typeof finalAmount !== "number" || !Number.isFinite(finalAmount) || finalAmount <= 0 || finalAmount > MAX_FINAL_AMOUNT) {
+      return res.status(400).json({ message: `finalAmount must be a positive number up to ${MAX_FINAL_AMOUNT}` });
     }
     set.finalAmount = finalAmount;
     set.completedAt = set.updatedAt;

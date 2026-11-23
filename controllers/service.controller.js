@@ -84,6 +84,8 @@ const validateService = (body = {}) => {
   const description = text(body.description);
   const { price } = body;
   const imageUrl = text(body.imageUrl) || null;
+  const duration = text(body.duration);
+  const serviceArea = text(body.serviceArea);
 
   if (title.length < 3 || title.length > 100) return { error: "Title must be 3 to 100 characters" };
   if (description.length < 10 || description.length > 1000) return { error: "Description must be 10 to 1000 characters" };
@@ -92,6 +94,8 @@ const validateService = (body = {}) => {
   if (typeof price !== "number" || !Number.isFinite(price) || price <= 0 || price > 100000) {
     return { error: "Price must be a number greater than 0" };
   }
+  if (duration.length > 50) return { error: "Estimated duration must be 50 characters or fewer" };
+  if (serviceArea.length > 100) return { error: "Service area must be 100 characters or fewer" };
   if (imageUrl && (!/^https:\/\/\S+$/.test(imageUrl) || imageUrl.length > 500)) {
     return { error: "Image must be an https link" };
   }
@@ -100,7 +104,7 @@ const validateService = (body = {}) => {
   }
 
   return {
-    data: { title, description, category: body.category, mode: body.mode, price, imageUrl, available: body.available ?? true },
+    data: { title, description, category: body.category, mode: body.mode, price, imageUrl, duration, serviceArea, available: body.available ?? true },
   };
 };
 

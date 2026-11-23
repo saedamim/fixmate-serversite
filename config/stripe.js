@@ -8,9 +8,9 @@ export const useStripe = (mock) => {
   override = mock;
 };
 
-// Only test secret keys (sk_test_...) are accepted
-export const isConfigured = () =>
-  Boolean(override) || (process.env.STRIPE_SECRET_KEY ?? "").startsWith("sk_test_");
+// Only TEST keys are accepted: a secret key (sk_test_...) or a restricted key (rk_test_...). Live keys are refused.
+const TEST_KEY = /^(sk|rk)_test_/;
+export const isConfigured = () => Boolean(override) || TEST_KEY.test(process.env.STRIPE_SECRET_KEY ?? "");
 
 export const getStripe = () => {
   if (override) return override;

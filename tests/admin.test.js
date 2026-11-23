@@ -12,6 +12,8 @@ import connectDB, { client, db } from "../config/db.js";
 import {
   getStats,
   getUsers,
+  updateUserRole,
+  changeUserRole,
   getAllServices,
   updateServiceStatus,
   getAllBookings,
@@ -47,13 +49,13 @@ const call = (method, path, token, body) =>
   }).then((r) => r.status);
 
 // Runs a controller with a fake request and returns { status, body }
-const run = async (handler, { query = {}, params = {}, body } = {}) => {
+const run = async (handler, { query = {}, params = {}, body, user = { id: "fake-admin", role: "admin" } } = {}) => {
   const out = { status: 200, body: undefined };
   const res = {
     status(code) { out.status = code; return res; },
     json(payload) { out.body = payload; return res; },
   };
-  await handler({ query, params, body, user: { id: "fake-admin", role: "admin" } }, res);
+  await handler({ query, params, body, user }, res);
   return out;
 };
 
@@ -87,6 +89,7 @@ const routes = [
   ["GET", "/api/admin/services"],
   ["GET", "/api/admin/bookings"],
   ["PATCH", `/api/admin/services/${new ObjectId()}/status`],
+  ["PATCH", `/api/admin/users/${new ObjectId()}/role`],
 ];
 
 test("admin routes reject requests without a token (401)", async () => {
@@ -175,4 +178,63 @@ test("bookings list covers all bookings and filters by status", async () => {
   const cancelled = (await run(getAllBookings, { query: { status: "cancelled" } })).body;
   assert.ok(cancelled.bookings.every((b) => b.status === "cancelled"));
   assert.equal(cancelled.total, await db.collection("bookings").countDocuments({ status: "cancelled" }));
+});
+
+test("admin can change a user's role; bad roles, bad ids, unknown users and self-changes are refused", async () => {
+  const user = await db.collection("user").findOne({ email: emails.customer });
+  const id = user._id.toString();
+  const change = (userId, role, actor = "fake-admin") =>
+    run(updateUserRole, { params: { id: userId }, body: { role }, user: { id: actor, role: "admin" } });
+
+  const ok = await change(id, "technician");
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.user.role, "technician");
+  assert.deepEqual(Object.keys(ok.body.user).sort(), ["createdAt", "email", "emailVerified", "id", "name", "role"].sort());
+  assert.equal((await db.collection("user").findOne({ _id: user._id })).role, "technician");
+
+  assert.equal((await change(id, "superuser")).status, 400);
+  assert.equal((await change(id, { $ne: "" })).status, 400);
+  assert.equal((await change("not-an-id", "customer")).status, 404);
+  assert.equal((await change(new ObjectId().toString(), "customer")).status, 404);
+  assert.equal((await change(id, "customer", id)).status, 400); // nobody changes their own role
+  assert.equal((await db.collection("user").findOne({ _id: user._id })).role, "technician"); // refused calls changed nothing
+
+  await change(id, "customer"); // restore
+});
+
+test("the last admin cannot be demoted", async () => {
+  const admins = await db.collection("user").find({ role: "admin" }).project({ _id: 1 }).toArray();
+  if (admins.length !== 1) return; // the guard only matters with exactly one admin; never touch real admins otherwise
+  const r = await run(updateUserRole, { params: { id: admins[0]._id.toString() }, body: { role: "customer" }, user: { id: "someone-else", role: "admin" } });
+  assert.equal(r.status, 409);
+  assert.equal((await db.collection("user").findOne({ _id: admins[0]._id })).role, "admin");
+});
+
+test("roles are read from the database: a demoted account loses access with its still-valid token", async () => {
+  const get = () => call("GET", "/api/services/mine", tokens.technician);
+  assert.equal(await get(), 200);
+  await db.collection("user").updateOne({ email: emails.technician }, { $set: { role: "customer" } });
+  assert.equal(await get(), 403); // same token, no new sign-in
+  await db.collection("user").updateOne({ email: emails.technician }, { $set: { role: "technician" } });
+  assert.equal(await get(), 200);
+});
+
+test("simultaneous demotions can never remove the last admin (scratch collection, real transactions)", async () => {
+  const scratch = client.db("fixmate_test_scratch").collection(`user_${Date.now()}`);
+  try {
+    for (let round = 0; round < 8; round++) {
+      await scratch.deleteMany({});
+      const { insertedIds } = await scratch.insertMany([
+        { name: "a", role: "admin" }, { name: "b", role: "admin" }, { name: "c", role: "customer" },
+      ]);
+      const [x, y] = await Promise.all([
+        changeUserRole(scratch, insertedIds[0].toString(), "customer"),
+        changeUserRole(scratch, insertedIds[1].toString(), "customer"),
+      ]);
+      assert.deepEqual([x.status, y.status].sort(), [200, 409], `round ${round}`);
+      assert.equal(await scratch.countDocuments({ role: "admin" }), 1, `round ${round}`);
+    }
+  } finally {
+    await scratch.drop().catch(() => {});
+  }
 });

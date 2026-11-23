@@ -4,6 +4,7 @@ import verifyRole from "../middlewares/verifyRole.js";
 import {
   getStats,
   getUsers,
+  updateUserRole,
   getAllServices,
   updateServiceStatus,
   getAllBookings,
@@ -17,6 +18,7 @@ router.use(verifyToken, verifyRole("admin"));
 
 router.get("/stats", getStats);
 router.get("/users", getUsers);
+router.patch("/users/:id/role", updateUserRole);
 router.get("/services", getAllServices);
 router.patch("/services/:id/status", updateServiceStatus);
 router.get("/bookings", getAllBookings);
